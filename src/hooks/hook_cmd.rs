@@ -51,7 +51,10 @@ pub fn run_copilot() -> Result<()> {
 fn detect_format(v: &Value) -> HookFormat {
     // VS Code Copilot Chat / Claude Code: snake_case keys
     if let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) {
-        if matches!(tool_name, "runTerminalCommand" | "Bash" | "bash") {
+        if matches!(
+            tool_name,
+            "runTerminalCommand" | "Bash" | "bash" | "PowerShell"
+        ) {
             if let Some(cmd) = v
                 .pointer("/tool_input/command")
                 .and_then(|c| c.as_str())

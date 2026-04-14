@@ -140,7 +140,7 @@ pub fn run(_verbose: u8) -> Result<()> {
     }
 
     if summaries.is_empty() {
-        println!("No sessions with Bash commands found.");
+        println!("No sessions with Bash or PowerShell commands found.");
         return Ok(());
     }
 
