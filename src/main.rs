@@ -44,6 +44,8 @@ pub enum AgentTarget {
     Kilocode,
     /// Google Antigravity
     Antigravity,
+    /// Claude Code with PowerShell tool (Windows / CLAUDE_CODE_USE_POWERSHELL_TOOL=1)
+    Powershell,
 }
 
 #[derive(Parser)]
@@ -1710,6 +1712,20 @@ fn run_cli() -> Result<i32> {
                     );
                 }
                 hooks::init::run_antigravity_mode(cli.verbose)?;
+            } else if agent == Some(AgentTarget::Powershell) {
+                let patch_mode = if auto_patch {
+                    hooks::init::PatchMode::Auto
+                } else if no_patch {
+                    hooks::init::PatchMode::Skip
+                } else {
+                    hooks::init::PatchMode::Ask
+                };
+                if !global {
+                    anyhow::bail!(
+                        "PowerShell hook is global-only. Use: rtk init -g --agent powershell"
+                    );
+                }
+                hooks::init::run_powershell_mode(patch_mode, cli.verbose)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;

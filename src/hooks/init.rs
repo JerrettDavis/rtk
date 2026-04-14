@@ -8,12 +8,15 @@ use tempfile::NamedTempFile;
 
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CODEX_DIR, GEMINI_HOOK_FILE, HOOKS_JSON, HOOKS_SUBDIR,
-    PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, REWRITE_HOOK_PS1_FILE, SETTINGS_JSON,
 };
 use super::integrity;
 
 // Embedded hook script (guards before set -euo pipefail)
 const REWRITE_HOOK: &str = include_str!("../../hooks/claude/rtk-rewrite.sh");
+
+// Embedded PowerShell hook script
+const REWRITE_HOOK_PS1: &str = include_str!("../../hooks/claude/rtk-rewrite.ps1");
 
 // Embedded Cursor hook script (preToolUse format)
 const CURSOR_REWRITE_HOOK: &str = include_str!("../../hooks/cursor/rtk-rewrite.sh");
@@ -686,6 +689,27 @@ pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose:
         removed.push("settings.json: removed RTK hook entry".to_string());
     }
 
+    // 4b. Remove PowerShell hook entry from settings.json
+    if remove_ps1_hook_from_settings(verbose)? {
+        removed.push("settings.json: removed PowerShell RTK hook entry".to_string());
+    }
+
+    // 4c. Remove PS1 hook file
+    let ps1_hook_path = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_PS1_FILE);
+    if ps1_hook_path.exists() {
+        fs::remove_file(&ps1_hook_path).with_context(|| {
+            format!(
+                "Failed to remove PowerShell hook: {}",
+                ps1_hook_path.display()
+            )
+        })?;
+        removed.push(format!("PowerShell hook: {}", ps1_hook_path.display()));
+    }
+    // Remove PS1 integrity hash
+    if integrity::remove_hash(&ps1_hook_path)? {
+        removed.push("PowerShell integrity hash: removed".to_string());
+    }
+
     // 5. Remove OpenCode plugin
     let opencode_removed = remove_opencode_plugin(verbose)?;
     for path in opencode_removed {
@@ -938,15 +962,22 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
 /// Default mode: hook + slim RTK.md + @RTK.md reference
 #[cfg(not(unix))]
 fn run_default_mode(
-    _global: bool,
-    _patch_mode: PatchMode,
-    _verbose: u8,
+    global: bool,
+    patch_mode: PatchMode,
+    verbose: u8,
     _install_opencode: bool,
 ) -> Result<()> {
-    eprintln!("[warn] Hook-based mode requires Unix (macOS/Linux).");
-    eprintln!("    Windows: use --claude-md mode for full injection.");
+    // On Windows, if CLAUDE_CODE_USE_POWERSHELL_TOOL is set and --global is used,
+    // install the PowerShell hook automatically.
+    if global && std::env::var_os("CLAUDE_CODE_USE_POWERSHELL_TOOL").is_some() {
+        eprintln!("[rtk] Detected CLAUDE_CODE_USE_POWERSHELL_TOOL — installing PowerShell hook.");
+        return run_powershell_mode(patch_mode, verbose);
+    }
+    eprintln!("[warn] Hook-based mode requires Unix (macOS/Linux) or PowerShell tool mode.");
+    eprintln!("    Windows (PowerShell): use: rtk init -g --agent powershell");
+    eprintln!("    Windows (bash/WSL):   run rtk init inside WSL.");
     eprintln!("    Falling back to --claude-md mode.");
-    run_claude_md_mode(_global, _verbose, _install_opencode)
+    run_claude_md_mode(global, verbose, _install_opencode)
 }
 
 #[cfg(unix)]
@@ -2141,6 +2172,12 @@ fn show_claude_config() -> Result<()> {
                     println!("[warn] settings.json: exists but RTK hook not configured");
                     println!("    Run: rtk init -g --auto-patch");
                 }
+                // Check PowerShell hook entry
+                let ps1_hook_path = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_PS1_FILE);
+                let ps1_command = format!("pwsh -NonInteractive -File {}", ps1_hook_path.display());
+                if ps1_hook_already_present(&root, &ps1_command) {
+                    println!("[ok] settings.json: PowerShell RTK hook configured");
+                }
             } else {
                 println!("[warn] settings.json: exists but invalid JSON");
             }
@@ -2149,6 +2186,12 @@ fn show_claude_config() -> Result<()> {
         }
     } else {
         println!("[--] settings.json: not found");
+    }
+
+    // Check PowerShell hook file
+    let ps1_hook_path = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_PS1_FILE);
+    if ps1_hook_path.exists() {
+        println!("[ok] PowerShell hook: {} (exists)", ps1_hook_path.display());
     }
 
     // Check OpenCode plugin
@@ -2237,7 +2280,8 @@ fn show_claude_config() -> Result<()> {
     println!("  rtk init --codex            # Configure local AGENTS.md + RTK.md");
     println!("  rtk init -g --codex         # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
     println!("  rtk init -g --opencode      # OpenCode plugin only");
-    println!("  rtk init -g --agent cursor  # Install Cursor Agent hooks");
+    println!("  rtk init -g --agent cursor  # Install Cursor Agent hooks
+  rtk init -g --agent powershell  # Install PowerShell hook (Windows / CLAUDE_CODE_USE_POWERSHELL_TOOL=1)");
 
     Ok(())
 }
@@ -2304,6 +2348,273 @@ fn run_opencode_only_mode(verbose: u8) -> Result<()> {
     println!("\nOpenCode plugin installed (global).\n");
     println!("  OpenCode: {}", opencode_plugin_path.display());
     println!("  Restart OpenCode. Test with: git status\n");
+    Ok(())
+}
+
+// ─── PowerShell (Windows) support ────────────────────────────────────────────
+
+/// Install PowerShell hook script, return true if the file changed.
+fn ensure_ps1_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
+    let changed = write_if_changed(hook_path, REWRITE_HOOK_PS1, "PowerShell hook", verbose)?;
+
+    // Store SHA-256 hash for runtime integrity verification (same as bash hook).
+    integrity::store_hash(hook_path)
+        .with_context(|| format!("Failed to store integrity hash for {}", hook_path.display()))?;
+    if verbose > 0 && changed {
+        eprintln!("Stored integrity hash for PowerShell hook");
+    }
+
+    Ok(changed)
+}
+
+/// Check if a PowerShell hook entry is already in settings.json.
+fn ps1_hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
+    let pre_tool_use_array = match root
+        .get("hooks")
+        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
+        .and_then(|p| p.as_array())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    pre_tool_use_array
+        .iter()
+        .filter_map(|entry| entry.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|hook| hook.get("command")?.as_str())
+        .any(|cmd| {
+            cmd == hook_command
+                || (cmd.contains(REWRITE_HOOK_PS1_FILE)
+                    && hook_command.contains(REWRITE_HOOK_PS1_FILE))
+        })
+}
+
+/// Insert a PowerShell hook entry into settings.json.
+/// Uses the `PowerShell` matcher so Claude Code routes PowerShell tool calls
+/// through the hook when `CLAUDE_CODE_USE_POWERSHELL_TOOL=1` is active.
+fn insert_ps1_hook_entry(root: &mut serde_json::Value, hook_command: &str) {
+    let root_obj = match root.as_object_mut() {
+        Some(obj) => obj,
+        None => {
+            *root = serde_json::json!({});
+            root.as_object_mut()
+                .expect("Just created object, must succeed")
+        }
+    };
+
+    let hooks = root_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("hooks must be an object");
+
+    let pre_tool_use = hooks
+        .entry(PRE_TOOL_USE_KEY)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .expect("PreToolUse must be an array");
+
+    pre_tool_use.push(serde_json::json!({
+        "matcher": "PowerShell",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command
+        }]
+    }));
+}
+
+/// Patch settings.json with a PowerShell hook entry.
+fn patch_settings_json_ps1(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result<PatchResult> {
+    let claude_dir = resolve_claude_dir()?;
+    let settings_path = claude_dir.join(SETTINGS_JSON);
+    // Claude Code on Windows invokes PS1 hooks via: pwsh -NonInteractive -File <path>
+    let hook_command = format!(
+        "pwsh -NonInteractive -File {}",
+        hook_path
+            .to_str()
+            .context("Hook path contains invalid UTF-8")?
+    );
+
+    let mut root = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)
+            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if ps1_hook_already_present(&root, &hook_command) {
+        if verbose > 0 {
+            eprintln!("settings.json: PowerShell hook already present");
+        }
+        return Ok(PatchResult::AlreadyPresent);
+    }
+
+    match mode {
+        PatchMode::Skip => {
+            println!("\n  MANUAL STEP: Add this to ~/.claude/settings.json:");
+            println!("  {{");
+            println!("    \"hooks\": {{ \"PreToolUse\": [{{");
+            println!("      \"matcher\": \"PowerShell\",");
+            println!("      \"hooks\": [{{ \"type\": \"command\",");
+            println!("        \"command\": \"{}\"", hook_command);
+            println!("      }}]");
+            println!("    }}]}}");
+            println!("  }}");
+            println!("\n  Then restart Claude Code. Test with: git status\n");
+            return Ok(PatchResult::Skipped);
+        }
+        PatchMode::Ask => {
+            if !prompt_user_consent(&settings_path)? {
+                println!("\n  MANUAL STEP: Add this to ~/.claude/settings.json:");
+                println!("  {{");
+                println!("    \"hooks\": {{ \"PreToolUse\": [{{");
+                println!("      \"matcher\": \"PowerShell\",");
+                println!("      \"hooks\": [{{ \"type\": \"command\",");
+                println!("        \"command\": \"{}\"", hook_command);
+                println!("      }}]");
+                println!("    }}]}}");
+                println!("  }}");
+                println!("\n  Then restart Claude Code. Test with: git status\n");
+                return Ok(PatchResult::Declined);
+            }
+        }
+        PatchMode::Auto => {}
+    }
+
+    insert_ps1_hook_entry(&mut root, &hook_command);
+
+    if settings_path.exists() {
+        let backup_path = settings_path.with_extension("json.bak");
+        fs::copy(&settings_path, &backup_path)
+            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Backup: {}", backup_path.display());
+        }
+    }
+
+    let serialized =
+        serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
+    atomic_write(&settings_path, &serialized)?;
+
+    println!("\n  settings.json: PowerShell hook added");
+    if settings_path.with_extension("json.bak").exists() {
+        println!(
+            "  Backup: {}",
+            settings_path.with_extension("json.bak").display()
+        );
+    }
+    println!("  Restart Claude Code. Test with: git status");
+
+    Ok(PatchResult::Patched)
+}
+
+/// Remove the PowerShell hook entry from settings.json.
+fn remove_ps1_hook_from_settings(verbose: u8) -> Result<bool> {
+    let claude_dir = resolve_claude_dir()?;
+    let settings_path = claude_dir.join(SETTINGS_JSON);
+
+    if !settings_path.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(&settings_path)
+        .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+    if content.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let mut root: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?;
+
+    let hooks = match root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(PRE_TOOL_USE_KEY))
+    {
+        Some(pre_tool_use) => pre_tool_use,
+        None => return Ok(false),
+    };
+
+    let pre_tool_use_array = match hooks.as_array_mut() {
+        Some(arr) => arr,
+        None => return Ok(false),
+    };
+
+    let original_len = pre_tool_use_array.len();
+    pre_tool_use_array.retain(|entry| {
+        if let Some(hooks_array) = entry.get("hooks").and_then(|h| h.as_array()) {
+            for hook in hooks_array {
+                if let Some(command) = hook.get("command").and_then(|c| c.as_str()) {
+                    if command.contains(REWRITE_HOOK_PS1_FILE) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    });
+
+    let removed = pre_tool_use_array.len() < original_len;
+
+    if removed {
+        let backup_path = settings_path.with_extension("json.bak");
+        fs::copy(&settings_path, &backup_path)
+            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+
+        let serialized =
+            serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
+        atomic_write(&settings_path, &serialized)?;
+
+        if verbose > 0 {
+            eprintln!("Removed PowerShell RTK hook from settings.json");
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Install the PowerShell hook for Claude Code with `CLAUDE_CODE_USE_POWERSHELL_TOOL=1`.
+///
+/// This installs `rtk-rewrite.ps1` into `~/.claude/hooks/` and adds a
+/// `"matcher": "PowerShell"` entry to `~/.claude/settings.json`.
+pub fn run_powershell_mode(patch_mode: PatchMode, verbose: u8) -> Result<()> {
+    let claude_dir = resolve_claude_dir()?;
+    let hook_dir = claude_dir.join(HOOKS_SUBDIR);
+    fs::create_dir_all(&hook_dir)
+        .with_context(|| format!("Failed to create hook directory: {}", hook_dir.display()))?;
+
+    let hook_path = hook_dir.join(REWRITE_HOOK_PS1_FILE);
+    let hook_changed = ensure_ps1_hook_installed(&hook_path, verbose)?;
+
+    let hook_status = if hook_changed {
+        "installed/updated"
+    } else {
+        "already up to date"
+    };
+    println!("\nRTK PowerShell hook {} (global).\n", hook_status);
+    println!("  Hook: {}", hook_path.display());
+    println!(
+        "  Tip:  Set CLAUDE_CODE_USE_POWERSHELL_TOOL=1 in your environment to enable PowerShell tool."
+    );
+
+    let patch_result = patch_settings_json_ps1(&hook_path, patch_mode, verbose)?;
+
+    match patch_result {
+        PatchResult::Patched => {}
+        PatchResult::AlreadyPresent => {
+            println!("\n  settings.json: PowerShell hook already present");
+            println!("  Restart Claude Code. Test with: git status");
+        }
+        PatchResult::Declined | PatchResult::Skipped => {}
+    }
+
+    println!(); // Final newline
     Ok(())
 }
 

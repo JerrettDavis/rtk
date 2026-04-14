@@ -2,7 +2,7 @@
 
 use super::constants::{
     CLAUDE_DIR, CODEX_DIR, CURSOR_DIR, GEMINI_DIR, GEMINI_HOOK_FILE, HOOKS_SUBDIR,
-    OPENCODE_PLUGIN_PATH, REWRITE_HOOK_FILE,
+    OPENCODE_PLUGIN_PATH, REWRITE_HOOK_FILE, REWRITE_HOOK_PS1_FILE,
 };
 use crate::core::constants::RTK_DATA_DIR;
 use std::path::PathBuf;
@@ -100,6 +100,9 @@ fn other_integration_installed(home: &std::path::Path) -> bool {
         home.join(CURSOR_DIR)
             .join(HOOKS_SUBDIR)
             .join(REWRITE_HOOK_FILE),
+        home.join(CLAUDE_DIR)
+            .join(HOOKS_SUBDIR)
+            .join(REWRITE_HOOK_PS1_FILE),
         home.join(CODEX_DIR).join("AGENTS.md"),
         home.join(GEMINI_DIR)
             .join(HOOKS_SUBDIR)
@@ -110,12 +113,20 @@ fn other_integration_installed(home: &std::path::Path) -> bool {
 
 fn hook_installed_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
+    // Check bash hook first, then PowerShell hook
     let path = home
         .join(CLAUDE_DIR)
         .join(HOOKS_SUBDIR)
         .join(REWRITE_HOOK_FILE);
     if path.exists() {
-        Some(path)
+        return Some(path);
+    }
+    let ps1_path = home
+        .join(CLAUDE_DIR)
+        .join(HOOKS_SUBDIR)
+        .join(REWRITE_HOOK_PS1_FILE);
+    if ps1_path.exists() {
+        Some(ps1_path)
     } else {
         None
     }
