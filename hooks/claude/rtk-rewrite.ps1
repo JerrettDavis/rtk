@@ -59,6 +59,12 @@ if ([string]::IsNullOrEmpty($CMD)) {
     exit 0
 }
 
+# Rewrite bare `ls` and `ls <args>` to `Get-ChildItem` before any other logic.
+if ($CMD -eq 'ls' -or $CMD -match '^ls\s+') {
+    $CMD = $CMD -replace '^ls\b', 'Get-ChildItem'
+    $HookInput.tool_input.command = $CMD
+}
+
 # Delegate all rewrite + permission logic to the Rust binary.
 $REWRITTEN = (& rtk rewrite "$CMD" 2>$null) -join "`n"
 $ExitCode = $LASTEXITCODE
