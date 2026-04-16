@@ -11,6 +11,11 @@ use crate::core::utils::resolved_command;
 use anyhow::Result;
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    #[cfg(target_os = "windows")]
+    if crate::core::utils::resolve_binary("wc").is_err() {
+        anyhow::bail!("{}", windows_wc_unavailable_message());
+    }
+
     let mut cmd = resolved_command("wc");
     for arg in args {
         cmd.arg(arg);
@@ -28,6 +33,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         |stdout| filter_wc_output(stdout, &mode),
         RunOptions::stdout_only(),
     )
+}
+
+fn windows_wc_unavailable_message() -> &'static str {
+    "`rtk wc` requires a real `wc` executable on PATH. Native PowerShell does not ship one by default.\nUse `Measure-Object -Line -Word -Character`, install a Unix-compatible `wc`, or run the command from WSL/Git Bash."
 }
 
 /// Which columns the user requested
@@ -374,5 +383,12 @@ mod tests {
         let raw = "";
         let result = filter_wc_output(raw, &WcMode::Full);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_windows_wc_unavailable_message_mentions_measure_object() {
+        let message = windows_wc_unavailable_message();
+        assert!(message.contains("Measure-Object"));
+        assert!(message.contains("WSL/Git Bash"));
     }
 }

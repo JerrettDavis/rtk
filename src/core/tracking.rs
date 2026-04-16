@@ -1358,6 +1358,12 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
@@ -1453,26 +1459,36 @@ mod tests {
     fn test_timed_execution_records_time() {
         let timer = TimedExecution::start();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        timer.track("test cmd", "rtk test", "raw input data", "filtered");
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after UNIX_EPOCH")
+            .as_nanos();
+        let tracked_cmd = format!("rtk test {unique_suffix}");
+        timer.track("test cmd", &tracked_cmd, "raw input data", "filtered");
 
         // Verify via DB that record exists
         let tracker = Tracker::new().expect("Failed to create tracker");
-        let recent = tracker.get_recent(5).expect("Failed to get recent");
-        assert!(recent.iter().any(|r| r.rtk_cmd == "rtk test"));
+        let recent = tracker.get_recent(100).expect("Failed to get recent");
+        assert!(recent.iter().any(|r| r.rtk_cmd == tracked_cmd));
     }
 
     // 6. TimedExecution::track_passthrough records with 0 tokens
     #[test]
     fn test_timed_execution_passthrough() {
         let timer = TimedExecution::start();
-        timer.track_passthrough("git tag", "rtk git tag (passthrough)");
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after UNIX_EPOCH")
+            .as_nanos();
+        let passthrough_cmd = format!("rtk git tag (passthrough {unique_suffix})");
+        timer.track_passthrough("git tag", &passthrough_cmd);
 
         let tracker = Tracker::new().expect("Failed to create tracker");
-        let recent = tracker.get_recent(5).expect("Failed to get recent");
+        let recent = tracker.get_recent(100).expect("Failed to get recent");
 
         let pt = recent
             .iter()
-            .find(|r| r.rtk_cmd.contains("passthrough"))
+            .find(|r| r.rtk_cmd == passthrough_cmd)
             .expect("Passthrough record not found");
 
         // savings_pct should be 0 for passthrough
@@ -1484,6 +1500,7 @@ mod tests {
     #[test]
     fn test_custom_db_path_env() {
         use std::env;
+        let _guard = env_lock().lock().expect("env lock poisoned");
 
         let custom_path = env::temp_dir().join("rtk_test_custom.db");
         env::set_var("RTK_DB_PATH", &custom_path);
@@ -1498,6 +1515,7 @@ mod tests {
     #[test]
     fn test_default_db_path() {
         use std::env;
+        let _guard = env_lock().lock().expect("env lock poisoned");
 
         // Ensure no env var is set
         env::remove_var("RTK_DB_PATH");

@@ -46,6 +46,13 @@ pub enum AgentTarget {
     Antigravity,
 }
 
+/// Target shell for Claude Code hook installation.
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum ShellTarget {
+    /// Claude Code PowerShell tool (Windows / CLAUDE_CODE_USE_POWERSHELL_TOOL=1)
+    Powershell,
+}
+
 #[derive(Parser)]
 #[command(
     name = "rtk",
@@ -325,6 +332,10 @@ enum Commands {
         #[arg(long, value_enum)]
         agent: Option<AgentTarget>,
 
+        /// Target Claude shell for hook installation
+        #[arg(long, value_enum)]
+        shell: Option<ShellTarget>,
+
         /// Show current configuration
         #[arg(long)]
         show: bool,
@@ -353,7 +364,7 @@ enum Commands {
         #[arg(long)]
         codex: bool,
 
-        /// Install GitHub Copilot integration (VS Code + CLI)
+        /// Install GitHub Copilot integration (VS Code + CLI, project-scoped)
         #[arg(long)]
         copilot: bool,
     },
@@ -1262,6 +1273,18 @@ fn shell_split(input: &str) -> Vec<String> {
     discover::lexer::shell_split(input)
 }
 
+fn proxy_windows_builtin_hint(command: &str) -> Option<&'static str> {
+    match command.to_ascii_lowercase().as_str() {
+        "dir" => Some(
+            "`rtk proxy` requires a real executable. In PowerShell, `dir` is an alias for `Get-ChildItem`, not a standalone program.\nUse `Get-ChildItem` directly, run `rtk tree .`, or proxy a real executable instead.",
+        ),
+        "echo" => Some(
+            "`rtk proxy` requires a real executable. In PowerShell and cmd.exe, `echo` is a shell builtin, not a standalone program.\nRun it directly in your shell, or proxy a real executable instead.",
+        ),
+        _ => None,
+    }
+}
+
 /// Merge pnpm global filters args with other ones for standard String-based commands
 fn merge_pnpm_args(filters: &[String], args: &[String]) -> Vec<String> {
     filters
@@ -1706,6 +1729,7 @@ fn run_cli() -> Result<i32> {
             opencode,
             gemini,
             agent,
+            shell,
             show,
             claude_md,
             hook_only,
@@ -1730,7 +1754,7 @@ fn run_cli() -> Result<i32> {
                 };
                 hooks::init::run_gemini(global, hook_only, patch_mode, cli.verbose)?;
             } else if copilot {
-                hooks::init::run_copilot(cli.verbose)?;
+                hooks::init::run_copilot(global, cli.verbose)?;
             } else if agent == Some(AgentTarget::Kilocode) {
                 if global {
                     anyhow::bail!("Kilo Code is project-scoped. Use: rtk init --agent kilocode");
@@ -1743,6 +1767,20 @@ fn run_cli() -> Result<i32> {
                     );
                 }
                 hooks::init::run_antigravity_mode(cli.verbose)?;
+            } else if shell == Some(ShellTarget::Powershell) {
+                let patch_mode = if auto_patch {
+                    hooks::init::PatchMode::Auto
+                } else if no_patch {
+                    hooks::init::PatchMode::Skip
+                } else {
+                    hooks::init::PatchMode::Ask
+                };
+                if !global {
+                    anyhow::bail!(
+                        "PowerShell hook is global-only. Use: rtk init -g --shell powershell"
+                    );
+                }
+                hooks::init::run_powershell_mode(patch_mode, cli.verbose)?;
             } else {
                 let install_opencode = opencode;
                 let install_claude = !opencode;
@@ -2201,14 +2239,23 @@ fn run_cli() -> Result<i32> {
                 }
             }
 
-            let mut child = ChildGuard(Some(
-                core::utils::resolved_command(cmd_name.as_ref())
-                    .args(&cmd_args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .context(format!("Failed to execute command: {}", cmd_name))?,
-            ));
+            let spawned = core::utils::resolved_command(cmd_name.as_ref())
+                .args(&cmd_args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let child_proc = match spawned {
+                Ok(child) => child,
+                Err(err) => {
+                    #[cfg(target_os = "windows")]
+                    if let Some(hint) = proxy_windows_builtin_hint(&cmd_name) {
+                        anyhow::bail!("{hint}\nOriginal error: {err}");
+                    }
+                    return Err(err).context(format!("Failed to execute command: {}", cmd_name));
+                }
+            };
+
+            let mut child = ChildGuard(Some(child_proc));
 
             // Store child PID for signal handler before anything can fail
             if let Some(ref inner) = child.0 {
@@ -2699,6 +2746,24 @@ mod tests {
     }
 
     #[test]
+    fn test_init_shell_powershell_parses() {
+        let cli = Cli::try_parse_from(["rtk", "init", "-g", "--shell", "powershell"]).unwrap();
+        match cli.command {
+            Commands::Init { global, shell, .. } => {
+                assert!(global);
+                assert_eq!(shell, Some(ShellTarget::Powershell));
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_agent_powershell_rejected() {
+        let result = Cli::try_parse_from(["rtk", "init", "-g", "--agent", "powershell"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_shell_split_simple() {
         assert_eq!(
             shell_split("head -50 file.php"),
@@ -2731,6 +2796,18 @@ mod tests {
     fn test_shell_split_empty() {
         let result: Vec<String> = shell_split("");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_proxy_windows_builtin_hint_for_dir() {
+        let hint = proxy_windows_builtin_hint("dir").expect("dir should have a Windows hint");
+        assert!(hint.contains("Get-ChildItem"));
+        assert!(hint.contains("rtk tree ."));
+    }
+
+    #[test]
+    fn test_proxy_windows_builtin_hint_for_unknown_command() {
+        assert!(proxy_windows_builtin_hint("git").is_none());
     }
 
     #[test]

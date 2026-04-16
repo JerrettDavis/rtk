@@ -58,6 +58,14 @@ fn progress_bar(pct: f64, width: usize) -> String {
 
 pub fn run(_verbose: u8) -> Result<()> {
     let provider = ClaudeProvider;
+    if !ClaudeProvider::has_projects_dir() {
+        println!(
+            "{}",
+            ClaudeProvider::missing_projects_dir_message("session")
+        );
+        return Ok(());
+    }
+
     let sessions = provider
         .discover_sessions(None, Some(30))
         .context("Failed to discover Claude Code sessions")?;
@@ -140,7 +148,7 @@ pub fn run(_verbose: u8) -> Result<()> {
     }
 
     if summaries.is_empty() {
-        println!("No sessions with Bash commands found.");
+        println!("No sessions with Bash or PowerShell commands found.");
         return Ok(());
     }
 

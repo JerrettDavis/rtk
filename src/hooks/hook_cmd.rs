@@ -65,7 +65,10 @@ pub fn run_copilot() -> Result<()> {
 fn detect_format(v: &Value) -> HookFormat {
     // VS Code Copilot Chat / Claude Code: snake_case keys
     if let Some(tool_name) = v.get("tool_name").and_then(|t| t.as_str()) {
-        if matches!(tool_name, "runTerminalCommand" | "Bash" | "bash") {
+        if matches!(
+            tool_name,
+            "runTerminalCommand" | "Bash" | "bash" | "PowerShell"
+        ) {
             if let Some(cmd) = v
                 .pointer("/tool_input/command")
                 .and_then(|c| c.as_str())
@@ -506,6 +509,14 @@ mod tests {
             detect_format(&vscode_input("runTerminalCommand", "cargo test")),
             HookFormat::VsCode { .. }
         ));
+    }
+
+    #[test]
+    fn test_detect_vscode_powershell() {
+        match detect_format(&vscode_input("PowerShell", "git status")) {
+            HookFormat::VsCode { command } => assert_eq!(command, "git status"),
+            _ => panic!("Expected VS Code PowerShell format"),
+        }
     }
 
     #[test]

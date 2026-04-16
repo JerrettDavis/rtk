@@ -42,10 +42,31 @@ pub trait SessionProvider {
 pub struct ClaudeProvider;
 
 impl ClaudeProvider {
+    fn projects_dir_path(home: &Path) -> PathBuf {
+        home.join(CLAUDE_DIR).join("projects")
+    }
+
+    pub fn projects_dir_hint() -> Option<PathBuf> {
+        dirs::home_dir().map(|home| Self::projects_dir_path(&home))
+    }
+
+    pub fn has_projects_dir() -> bool {
+        Self::projects_dir_hint().is_some_and(|dir| dir.exists())
+    }
+
+    pub fn missing_projects_dir_message(command: &str) -> String {
+        let dir = Self::projects_dir_hint()
+            .unwrap_or_else(|| PathBuf::from("~").join(CLAUDE_DIR).join("projects"));
+        format!(
+            "No Claude Code history found.\n`rtk {command}` requires Claude Code session logs under {}.\nRun Claude Code at least once, or use `rtk gain --history` for RTK-only usage data.",
+            dir.display()
+        )
+    }
+
     /// Get the base directory for Claude Code projects.
     fn projects_dir() -> Result<PathBuf> {
         let home = dirs::home_dir().context("could not determine home directory")?;
-        let dir = home.join(CLAUDE_DIR).join("projects");
+        let dir = Self::projects_dir_path(&home);
         if !dir.exists() {
             anyhow::bail!(
                 "Claude Code projects directory not found: {}\nMake sure Claude Code has been used at least once.",
@@ -135,7 +156,7 @@ impl SessionProvider for ClaudeProvider {
             .unwrap_or("unknown")
             .to_string();
 
-        // First pass: collect all tool_use Bash commands with their IDs and sequence
+        // First pass: collect all tool_use Bash/PowerShell commands with their IDs and sequence
         // Second pass (same loop): collect tool_result output lengths, content, and error status
         let mut pending_tool_uses: Vec<(String, String, usize)> = Vec::new(); // (tool_use_id, command, sequence)
         let mut tool_results: HashMap<String, (usize, String, bool)> = HashMap::new(); // (len, content, is_error)
@@ -148,8 +169,11 @@ impl SessionProvider for ClaudeProvider {
                 Err(_) => continue,
             };
 
-            // Pre-filter: skip lines that can't contain Bash tool_use or tool_result
-            if !line.contains("\"Bash\"") && !line.contains("\"tool_result\"") {
+            // Pre-filter: skip lines that can't contain Bash/PowerShell tool_use or tool_result
+            if !line.contains("\"Bash\"")
+                && !line.contains("\"PowerShell\"")
+                && !line.contains("\"tool_result\"")
+            {
                 continue;
             }
 
@@ -162,13 +186,14 @@ impl SessionProvider for ClaudeProvider {
 
             match entry_type {
                 "assistant" => {
-                    // Look for tool_use Bash blocks in message.content
+                    // Look for tool_use Bash or PowerShell blocks in message.content
                     if let Some(content) =
                         entry.pointer("/message/content").and_then(|c| c.as_array())
                     {
                         for block in content {
+                            let name = block.get("name").and_then(|n| n.as_str());
                             if block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                                && block.get("name").and_then(|n| n.as_str()) == Some("Bash")
+                                && matches!(name, Some("Bash") | Some("PowerShell"))
                             {
                                 if let (Some(id), Some(cmd)) = (
                                     block.get("id").and_then(|i| i.as_str()),
@@ -286,6 +311,41 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_powershell_tool() {
+        // When CLAUDE_CODE_USE_POWERSHELL_TOOL=1 is set, Claude Code uses the
+        // "PowerShell" tool name instead of "Bash". We should extract these the
+        // same way.
+        let jsonl = make_jsonl(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ps1","name":"PowerShell","input":{"command":"git status"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ps1","content":"On branch main\nnothing to commit"}]}}"#,
+        ]);
+
+        let provider = ClaudeProvider;
+        let cmds = provider.extract_commands(jsonl.path()).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].command, "git status");
+        assert_eq!(
+            cmds[0].output_len.unwrap(),
+            "On branch main\nnothing to commit".len()
+        );
+    }
+
+    #[test]
+    fn test_extract_mixed_bash_and_powershell() {
+        // Sessions can contain both Bash and PowerShell tool calls.
+        let jsonl = make_jsonl(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git log -5"}},{"type":"tool_use","id":"t2","name":"PowerShell","input":{"command":"rtk cargo test"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"commit abc"},{"type":"tool_result","tool_use_id":"t2","content":"test result: ok"}]}}"#,
+        ]);
+
+        let provider = ClaudeProvider;
+        let cmds = provider.extract_commands(jsonl.path()).unwrap();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].command, "git log -5");
+        assert_eq!(cmds[1].command, "rtk cargo test");
+    }
+
+    #[test]
     fn test_extract_non_message_ignored() {
         let jsonl =
             make_jsonl(&[r#"{"type":"file-history-snapshot","messageId":"abc","snapshot":{}}"#]);
@@ -342,6 +402,25 @@ mod tests {
         let encoded = ClaudeProvider::encode_project_path("/Users/foo/Sites/rtk");
         assert!(encoded.contains("rtk"));
         assert!(encoded.contains("Sites"));
+    }
+
+    #[test]
+    fn test_projects_dir_path() {
+        let dir = ClaudeProvider::projects_dir_path(Path::new("/Users/foo"));
+        assert_eq!(
+            dir,
+            PathBuf::from("/Users/foo")
+                .join(CLAUDE_DIR)
+                .join("projects")
+        );
+    }
+
+    #[test]
+    fn test_missing_projects_dir_message_mentions_command_and_fallback() {
+        let message = ClaudeProvider::missing_projects_dir_message("discover");
+        assert!(message.contains("No Claude Code history found."));
+        assert!(message.contains("`rtk discover`"));
+        assert!(message.contains("rtk gain --history"));
     }
 
     #[test]

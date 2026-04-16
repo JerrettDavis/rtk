@@ -19,6 +19,11 @@ lazy_static! {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    #[cfg(target_os = "windows")]
+    if crate::core::utils::resolve_binary("ls").is_err() {
+        anyhow::bail!("{}", windows_ls_unavailable_message());
+    }
+
     let show_all = args
         .iter()
         .any(|a| (a.starts_with('-') && !a.starts_with("--") && a.contains('a')) || a == "--all");
@@ -100,6 +105,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
             .early_exit_on_failure()
             .no_trailing_newline(),
     )
+}
+
+fn windows_ls_unavailable_message() -> &'static str {
+    "`rtk ls` requires a real `ls` executable on PATH. In native PowerShell, `ls` is usually an alias for `Get-ChildItem`, not a standalone program.\nUse `rtk tree .`, run `Get-ChildItem` directly, or install a Unix-compatible `ls`."
 }
 
 /// Format bytes into human-readable size
@@ -467,5 +476,12 @@ mod tests {
         assert_eq!(ft, '-');
         assert_eq!(size, 5678);
         assert_eq!(name, "old.tar.gz");
+    }
+
+    #[test]
+    fn test_windows_ls_unavailable_message_mentions_powershell_alternatives() {
+        let message = windows_ls_unavailable_message();
+        assert!(message.contains("Get-ChildItem"));
+        assert!(message.contains("rtk tree ."));
     }
 }

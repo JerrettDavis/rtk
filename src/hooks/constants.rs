@@ -1,4 +1,5 @@
 pub const REWRITE_HOOK_FILE: &str = "rtk-rewrite.sh";
+pub const REWRITE_HOOK_PS1_FILE: &str = "rtk-rewrite.ps1";
 pub const GEMINI_HOOK_FILE: &str = "rtk-hook-gemini.sh";
 pub const CLAUDE_DIR: &str = ".claude";
 pub const HOOKS_SUBDIR: &str = "hooks";

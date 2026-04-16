@@ -8,9 +8,19 @@ use tempfile::NamedTempFile;
 
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND,
-    GEMINI_HOOK_FILE, HOOKS_JSON, HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    GEMINI_HOOK_FILE, HOOKS_JSON, HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
+    REWRITE_HOOK_PS1_FILE, SETTINGS_JSON,
 };
 use super::integrity;
+
+// Embedded hook script (guards before set -euo pipefail)
+const REWRITE_HOOK: &str = include_str!("../../hooks/claude/rtk-rewrite.sh");
+
+// Embedded PowerShell hook script
+const REWRITE_HOOK_PS1: &str = include_str!("../../hooks/claude/rtk-rewrite.ps1");
+
+// Embedded Cursor hook script (preToolUse format)
+const CURSOR_REWRITE_HOOK: &str = include_str!("../../hooks/cursor/rtk-rewrite.sh");
 
 // Embedded OpenCode plugin (auto-rewrite)
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
@@ -55,6 +65,7 @@ const CLAUDE_MD: &str = "CLAUDE.md";
 const AGENTS_MD: &str = "AGENTS.md";
 const RTK_MD_REF: &str = "@RTK.md";
 const GEMINI_MD: &str = "GEMINI.md";
+const POWERSHELL_HOOK_MATCHER: &str = "Bash|PowerShell";
 
 /// Control flow for settings.json patching
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -630,6 +641,26 @@ pub fn uninstall(global: bool, gemini: bool, codex: bool, cursor: bool, verbose:
         removed.push("settings.json: removed RTK hook entry".to_string());
     }
 
+    // 4b. Remove PowerShell hook entry from settings.json
+    if remove_ps1_hook_from_settings(verbose)? {
+        removed.push("settings.json: removed PowerShell RTK hook entry".to_string());
+    }
+
+    // 4c. Remove PS1 hook file and integrity hash
+    let ps1_hook_path = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_PS1_FILE);
+    if ps1_hook_path.exists() {
+        fs::remove_file(&ps1_hook_path).with_context(|| {
+            format!(
+                "Failed to remove PowerShell hook: {}",
+                ps1_hook_path.display()
+            )
+        })?;
+        removed.push(format!("PowerShell hook: {}", ps1_hook_path.display()));
+    }
+    if integrity::remove_hash(&ps1_hook_path)? {
+        removed.push("PowerShell integrity hash: removed".to_string());
+    }
+
     // 5. Remove OpenCode plugin
     let opencode_removed = remove_opencode_plugin(verbose)?;
     for path in opencode_removed {
@@ -874,15 +905,20 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
 /// Default mode: hook + slim RTK.md + @RTK.md reference
 #[cfg(not(unix))]
 fn run_default_mode(
-    _global: bool,
-    _patch_mode: PatchMode,
-    _verbose: u8,
+    global: bool,
+    patch_mode: PatchMode,
+    verbose: u8,
     _install_opencode: bool,
 ) -> Result<()> {
-    eprintln!("[warn] Hook-based mode requires Unix (macOS/Linux).");
-    eprintln!("    Windows: use --claude-md mode for full injection.");
+    if global && std::env::var_os("CLAUDE_CODE_USE_POWERSHELL_TOOL").is_some() {
+        eprintln!("[rtk] Detected CLAUDE_CODE_USE_POWERSHELL_TOOL - installing PowerShell hook.");
+        return run_powershell_mode(patch_mode, verbose);
+    }
+    eprintln!("[warn] Hook-based mode requires Unix (macOS/Linux) or PowerShell tool mode.");
+    eprintln!("    Windows (PowerShell): use: rtk init -g --shell powershell");
+    eprintln!("    Windows (bash/WSL):   run rtk init inside WSL.");
     eprintln!("    Falling back to --claude-md mode.");
-    run_claude_md_mode(_global, _verbose, _install_opencode)
+    run_claude_md_mode(global, verbose, _install_opencode)
 }
 
 #[cfg(unix)]
@@ -2099,6 +2135,13 @@ fn show_claude_config() -> Result<()> {
                     println!("[warn] settings.json: exists but RTK hook not configured");
                     println!("    Run: rtk init -g --auto-patch");
                 }
+                let ps1_hook_path = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_PS1_FILE);
+                let ps1_command = ps1_hook_command(&ps1_hook_path)?;
+                if ps1_hook_already_present(&root, &ps1_command) {
+                    println!(
+                        "[ok] settings.json: PowerShell RTK hook configured for Bash/PowerShell"
+                    );
+                }
             } else {
                 println!("[warn] settings.json: exists but invalid JSON");
             }
@@ -2107,6 +2150,11 @@ fn show_claude_config() -> Result<()> {
         }
     } else {
         println!("[--] settings.json: not found");
+    }
+
+    let ps1_hook_path = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_PS1_FILE);
+    if ps1_hook_path.exists() {
+        println!("[ok] PowerShell hook: {} (exists)", ps1_hook_path.display());
     }
 
     // Check OpenCode plugin
@@ -2185,6 +2233,7 @@ fn show_claude_config() -> Result<()> {
     println!("  rtk init -g --codex         # Configure $CODEX_HOME/AGENTS.md + $CODEX_HOME/RTK.md (or ~/.codex/)");
     println!("  rtk init -g --opencode      # OpenCode plugin only");
     println!("  rtk init -g --agent cursor  # Install Cursor Agent hooks");
+    println!("  rtk init -g --shell powershell  # Install PowerShell hook (Windows / CLAUDE_CODE_USE_POWERSHELL_TOOL=1)");
 
     Ok(())
 }
@@ -2509,7 +2558,11 @@ rtk proxy <cmd>       # Run raw (no filtering) but track usage
 "#;
 
 /// Entry point for `rtk init --copilot`
-pub fn run_copilot(verbose: u8) -> Result<()> {
+pub fn run_copilot(global: bool, verbose: u8) -> Result<()> {
+    if global {
+        anyhow::bail!("GitHub Copilot integration is project-scoped. Use: rtk init --copilot");
+    }
+
     // Install in current project's .github/ directory
     let github_dir = Path::new(".github");
     let hooks_dir = github_dir.join("hooks");
@@ -2541,6 +2594,309 @@ pub fn run_copilot(verbose: u8) -> Result<()> {
     println!("  and Copilot CLI (deny-with-suggestion).");
     println!("\n  Restart your IDE or Copilot CLI session to activate.\n");
 
+    Ok(())
+}
+
+// --- PowerShell (Windows) support ---
+
+fn ensure_ps1_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
+    let changed = write_if_changed(hook_path, REWRITE_HOOK_PS1, "PowerShell hook", verbose)?;
+
+    integrity::store_hash(hook_path)
+        .with_context(|| format!("Failed to store integrity hash for {}", hook_path.display()))?;
+    if verbose > 0 && changed {
+        eprintln!("Stored integrity hash for PowerShell hook");
+    }
+
+    Ok(changed)
+}
+
+fn ps1_hook_command(hook_path: &Path) -> Result<String> {
+    let hook_path = hook_path
+        .to_str()
+        .context("Hook path contains invalid UTF-8")?
+        .replace('\\', "/");
+    Ok(format!("pwsh -NonInteractive -File \"{}\"", hook_path))
+}
+
+fn ps1_hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
+    let pre_tool_use_array = match root
+        .get("hooks")
+        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
+        .and_then(|p| p.as_array())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    pre_tool_use_array.iter().any(|entry| {
+        entry.get("matcher").and_then(|m| m.as_str()) == Some(POWERSHELL_HOOK_MATCHER)
+            && entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|hook| hook.get("command")?.as_str())
+                .any(|cmd| cmd == hook_command)
+    })
+}
+
+fn insert_ps1_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> bool {
+    let root_obj = match root.as_object_mut() {
+        Some(obj) => obj,
+        None => {
+            *root = serde_json::json!({});
+            root.as_object_mut()
+                .expect("Just created object, must succeed")
+        }
+    };
+
+    let hooks = root_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("hooks must be an object");
+
+    let pre_tool_use = hooks
+        .entry(PRE_TOOL_USE_KEY)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .expect("PreToolUse must be an array");
+
+    for entry in pre_tool_use.iter_mut() {
+        let has_ps1_hook = entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .into_iter()
+            .flatten()
+            .any(|hook| {
+                hook.get("command")
+                    .and_then(|cmd| cmd.as_str())
+                    .is_some_and(|cmd| cmd.contains(REWRITE_HOOK_PS1_FILE))
+            });
+
+        if !has_ps1_hook {
+            continue;
+        }
+
+        let mut changed = false;
+        if entry.get("matcher").and_then(|m| m.as_str()) != Some(POWERSHELL_HOOK_MATCHER) {
+            entry["matcher"] = serde_json::Value::String(POWERSHELL_HOOK_MATCHER.to_string());
+            changed = true;
+        }
+
+        let Some(hooks_array) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            continue;
+        };
+
+        for hook in hooks_array.iter_mut() {
+            let Some(command) = hook.get("command").and_then(|cmd| cmd.as_str()) else {
+                continue;
+            };
+            if command.contains(REWRITE_HOOK_PS1_FILE) && command != hook_command {
+                hook["command"] = serde_json::Value::String(hook_command.to_string());
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    pre_tool_use.push(serde_json::json!({
+        "matcher": POWERSHELL_HOOK_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": hook_command
+        }]
+    }));
+    true
+}
+
+fn patch_settings_json_ps1(hook_path: &Path, mode: PatchMode, verbose: u8) -> Result<PatchResult> {
+    let claude_dir = resolve_claude_dir()?;
+    let settings_path = claude_dir.join(SETTINGS_JSON);
+    let hook_command = ps1_hook_command(hook_path)?;
+
+    let mut root = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)
+            .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if ps1_hook_already_present(&root, &hook_command) {
+        if verbose > 0 {
+            eprintln!("settings.json: PowerShell hook already present");
+        }
+        return Ok(PatchResult::AlreadyPresent);
+    }
+
+    match mode {
+        PatchMode::Skip => {
+            println!("\n  MANUAL STEP: Add this to ~/.claude/settings.json:");
+            println!("  {{");
+            println!("    \"hooks\": {{ \"PreToolUse\": [{{");
+            println!("      \"matcher\": \"{}\",", POWERSHELL_HOOK_MATCHER);
+            println!("      \"hooks\": [{{ \"type\": \"command\",");
+            println!("        \"command\": \"{}\"", hook_command);
+            println!("      }}]");
+            println!("    }}]}}");
+            println!("  }}");
+            println!("\n  Then restart Claude Code. Test with: git status\n");
+            return Ok(PatchResult::Skipped);
+        }
+        PatchMode::Ask => {
+            if !prompt_user_consent(&settings_path)? {
+                println!("\n  MANUAL STEP: Add this to ~/.claude/settings.json:");
+                println!("  {{");
+                println!("    \"hooks\": {{ \"PreToolUse\": [{{");
+                println!("      \"matcher\": \"{}\",", POWERSHELL_HOOK_MATCHER);
+                println!("      \"hooks\": [{{ \"type\": \"command\",");
+                println!("        \"command\": \"{}\"", hook_command);
+                println!("      }}]");
+                println!("    }}]}}");
+                println!("  }}");
+                println!("\n  Then restart Claude Code. Test with: git status\n");
+                return Ok(PatchResult::Declined);
+            }
+        }
+        PatchMode::Auto => {}
+    }
+
+    let changed = insert_ps1_hook_entry(&mut root, &hook_command);
+    if !changed {
+        if verbose > 0 {
+            eprintln!("settings.json: PowerShell hook already present");
+        }
+        return Ok(PatchResult::AlreadyPresent);
+    }
+
+    if settings_path.exists() {
+        let backup_path = settings_path.with_extension("json.bak");
+        fs::copy(&settings_path, &backup_path)
+            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Backup: {}", backup_path.display());
+        }
+    }
+
+    let serialized =
+        serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
+    atomic_write(&settings_path, &serialized)?;
+
+    println!("\n  settings.json: PowerShell hook added");
+    if settings_path.with_extension("json.bak").exists() {
+        println!(
+            "  Backup: {}",
+            settings_path.with_extension("json.bak").display()
+        );
+    }
+    println!("  Restart Claude Code. Test with: git status");
+
+    Ok(PatchResult::Patched)
+}
+
+fn remove_ps1_hook_from_settings(verbose: u8) -> Result<bool> {
+    let claude_dir = resolve_claude_dir()?;
+    let settings_path = claude_dir.join(SETTINGS_JSON);
+
+    if !settings_path.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(&settings_path)
+        .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+    if content.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let mut root: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?;
+
+    let removed = remove_ps1_hook_from_json(&mut root);
+
+    if removed {
+        let backup_path = settings_path.with_extension("json.bak");
+        fs::copy(&settings_path, &backup_path)
+            .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
+
+        let serialized =
+            serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
+        atomic_write(&settings_path, &serialized)?;
+
+        if verbose > 0 {
+            eprintln!("Removed PowerShell RTK hook from settings.json");
+        }
+    }
+
+    Ok(removed)
+}
+
+fn remove_ps1_hook_from_json(root: &mut serde_json::Value) -> bool {
+    let pre_tool_use = match root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(PRE_TOOL_USE_KEY))
+        .and_then(|p| p.as_array_mut())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    let original_len = pre_tool_use.len();
+    pre_tool_use.retain(|entry| {
+        !entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .is_some_and(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|command| command.contains(REWRITE_HOOK_PS1_FILE))
+                })
+            })
+    });
+
+    pre_tool_use.len() < original_len
+}
+
+pub fn run_powershell_mode(patch_mode: PatchMode, verbose: u8) -> Result<()> {
+    let claude_dir = resolve_claude_dir()?;
+    let hook_dir = claude_dir.join(HOOKS_SUBDIR);
+    fs::create_dir_all(&hook_dir)
+        .with_context(|| format!("Failed to create hook directory: {}", hook_dir.display()))?;
+
+    let hook_path = hook_dir.join(REWRITE_HOOK_PS1_FILE);
+    let hook_changed = ensure_ps1_hook_installed(&hook_path, verbose)?;
+
+    let hook_status = if hook_changed {
+        "installed/updated"
+    } else {
+        "already up to date"
+    };
+    println!("\nRTK PowerShell hook {} (global).\n", hook_status);
+    println!("  Hook: {}", hook_path.display());
+    println!(
+        "  Tip:  Set CLAUDE_CODE_USE_POWERSHELL_TOOL=1 in your environment to enable PowerShell tool."
+    );
+
+    let patch_result = patch_settings_json_ps1(&hook_path, patch_mode, verbose)?;
+
+    match patch_result {
+        PatchResult::Patched => {}
+        PatchResult::AlreadyPresent => {
+            println!("\n  settings.json: PowerShell hook already present");
+            println!("  Restart Claude Code. Test with: git status");
+        }
+        PatchResult::Declined | PatchResult::Skipped => {}
+    }
+
+    println!();
     Ok(())
 }
 
@@ -2581,6 +2937,48 @@ mod tests {
             RTK_INSTRUCTIONS.contains("<!-- rtk-instructions"),
             "RTK_INSTRUCTIONS must have version marker for idempotency"
         );
+    }
+
+    #[test]
+    fn test_run_copilot_rejects_global_mode() {
+        let err = run_copilot(true, 0).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("GitHub Copilot integration is project-scoped"));
+    }
+
+    #[test]
+    fn test_hook_has_guards() {
+        assert!(REWRITE_HOOK.contains("command -v rtk"));
+        assert!(REWRITE_HOOK.contains("command -v jq"));
+        // Guards (rtk/jq availability checks) must appear before the actual delegation call.
+        // The thin delegating hook no longer uses set -euo pipefail.
+        let jq_pos = REWRITE_HOOK.find("command -v jq").unwrap();
+        let rtk_delegate_pos = REWRITE_HOOK.find("rtk rewrite \"$CMD\"").unwrap();
+        assert!(
+            jq_pos < rtk_delegate_pos,
+            "Guards must appear before rtk rewrite delegation"
+        );
+    }
+
+    #[test]
+    fn test_powershell_hook_has_guards() {
+        assert!(REWRITE_HOOK_PS1.contains("Get-Command rtk"));
+        assert!(REWRITE_HOOK_PS1.contains("rtk --version"));
+        let version_check_pos = REWRITE_HOOK_PS1.find("rtk --version").unwrap();
+        let rewrite_pos = REWRITE_HOOK_PS1.find("& rtk rewrite").unwrap();
+        assert!(
+            version_check_pos < rewrite_pos,
+            "Version guard must appear before rtk rewrite delegation"
+        );
+    }
+
+    #[test]
+    fn test_powershell_hook_outputs_claude_pretooluse_format() {
+        assert!(REWRITE_HOOK_PS1.contains("hookSpecificOutput"));
+        assert!(REWRITE_HOOK_PS1.contains("hookEventName = \"PreToolUse\""));
+        assert!(REWRITE_HOOK_PS1.contains("updatedInput"));
+        assert!(REWRITE_HOOK_PS1.contains("permissionDecision"));
     }
 
     #[test]
@@ -3101,6 +3499,148 @@ More notes
         assert!(json_content.get("hooks").is_some());
     }
 
+    #[test]
+    fn test_ps1_hook_already_present_exact_match() {
+        let json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash|PowerShell",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\""
+                    }]
+                }]
+            }
+        });
+
+        let hook_command =
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\"";
+        assert!(ps1_hook_already_present(&json_content, hook_command));
+    }
+
+    #[test]
+    fn test_ps1_hook_command_quotes_and_normalizes_path() {
+        let command =
+            ps1_hook_command(Path::new(r"C:\Users\test\.claude\hooks\rtk-rewrite.ps1")).unwrap();
+
+        assert_eq!(
+            command,
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\""
+        );
+    }
+
+    #[test]
+    fn test_ps1_hook_not_present_when_matcher_is_legacy() {
+        let json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "PowerShell",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\""
+                    }]
+                }]
+            }
+        });
+
+        let hook_command =
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\"";
+        assert!(!ps1_hook_already_present(&json_content, hook_command));
+    }
+
+    #[test]
+    fn test_ps1_hook_not_present_when_command_path_differs() {
+        let json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash|PowerShell",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "pwsh -NonInteractive -File \"D:/Claude/hooks/rtk-rewrite.ps1\""
+                    }]
+                }]
+            }
+        });
+
+        let hook_command =
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\"";
+        assert!(!ps1_hook_already_present(&json_content, hook_command));
+    }
+
+    #[test]
+    fn test_ps1_hook_not_present_empty() {
+        assert!(!ps1_hook_already_present(
+            &serde_json::json!({}),
+            "pwsh -File hook.ps1"
+        ));
+    }
+
+    #[test]
+    fn test_insert_ps1_hook_entry_empty_root() {
+        let mut json_content = serde_json::json!({});
+        let hook_command =
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\"";
+
+        let changed = insert_ps1_hook_entry(&mut json_content, hook_command);
+
+        assert!(changed);
+        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 1);
+        assert_eq!(pre_tool_use[0]["matcher"], POWERSHELL_HOOK_MATCHER);
+        assert_eq!(pre_tool_use[0]["hooks"][0]["command"], hook_command);
+    }
+
+    #[test]
+    fn test_insert_ps1_hook_entry_preserves_existing() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/some/other/hook.sh"
+                    }]
+                }]
+            }
+        });
+
+        let hook_command =
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\"";
+        let changed = insert_ps1_hook_entry(&mut json_content, hook_command);
+
+        assert!(changed);
+        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 2);
+        assert_eq!(
+            pre_tool_use[0]["hooks"][0]["command"],
+            "/some/other/hook.sh"
+        );
+        assert_eq!(pre_tool_use[1]["matcher"], POWERSHELL_HOOK_MATCHER);
+        assert_eq!(pre_tool_use[1]["hooks"][0]["command"], hook_command);
+    }
+
+    #[test]
+    fn test_insert_ps1_hook_preserves_other_keys() {
+        let mut json_content = serde_json::json!({
+            "env": {"PATH": "C:\\custom\\bin"},
+            "permissions": {"allowAll": true},
+            "model": "claude-sonnet-4"
+        });
+
+        let hook_command =
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\"";
+        let changed = insert_ps1_hook_entry(&mut json_content, hook_command);
+
+        assert!(changed);
+        assert_eq!(json_content["env"]["PATH"], "C:\\custom\\bin");
+        assert_eq!(json_content["permissions"]["allowAll"], true);
+        assert_eq!(json_content["model"], "claude-sonnet-4");
+        assert_eq!(
+            json_content["hooks"]["PreToolUse"][0]["matcher"],
+            POWERSHELL_HOOK_MATCHER
+        );
+    }
+
     // Tests for atomic_write()
     #[test]
     fn test_atomic_write() {
@@ -3237,6 +3777,103 @@ More notes
         });
 
         let removed = remove_hook_from_json(&mut json_content);
+        assert!(!removed);
+    }
+
+    #[test]
+    fn test_insert_ps1_hook_entry_updates_legacy_matcher() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "PowerShell",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "pwsh -NonInteractive -File C:\\Users\\test\\.claude\\hooks\\rtk-rewrite.ps1"
+                    }]
+                }]
+            }
+        });
+
+        let hook_command =
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\"";
+        let changed = insert_ps1_hook_entry(&mut json_content, hook_command);
+
+        assert!(changed);
+        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 1);
+        assert_eq!(pre_tool_use[0]["matcher"], POWERSHELL_HOOK_MATCHER);
+        assert_eq!(pre_tool_use[0]["hooks"][0]["command"], hook_command);
+    }
+
+    #[test]
+    fn test_insert_ps1_hook_entry_no_change_when_current() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash|PowerShell",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\""
+                    }]
+                }]
+            }
+        });
+
+        let hook_command =
+            "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\"";
+        let changed = insert_ps1_hook_entry(&mut json_content, hook_command);
+
+        assert!(!changed);
+        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_ps1_hook_from_json() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "/some/other/hook.sh"
+                        }]
+                    },
+                    {
+                        "matcher": "Bash|PowerShell",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "pwsh -NonInteractive -File \"C:/Users/test/.claude/hooks/rtk-rewrite.ps1\""
+                        }]
+                    }
+                ]
+            }
+        });
+
+        let removed = remove_ps1_hook_from_json(&mut json_content);
+        assert!(removed);
+
+        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool_use.len(), 1);
+        assert_eq!(pre_tool_use[0]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn test_remove_ps1_hook_when_not_present() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/some/other/hook.sh"
+                    }]
+                }]
+            }
+        });
+
+        let removed = remove_ps1_hook_from_json(&mut json_content);
         assert!(!removed);
     }
 

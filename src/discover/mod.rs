@@ -42,6 +42,13 @@ pub fn run(
     verbose: u8,
 ) -> Result<()> {
     let provider = ClaudeProvider;
+    if !ClaudeProvider::has_projects_dir() {
+        println!(
+            "{}",
+            ClaudeProvider::missing_projects_dir_message("discover")
+        );
+        return Ok(());
+    }
 
     // Determine project filter
     let project_filter = if all {

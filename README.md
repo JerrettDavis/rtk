@@ -115,9 +115,9 @@ rtk init --agent antigravity    # Google Antigravity
 git status  # Automatically rewritten to rtk git status
 ```
 
-The hook transparently rewrites Bash commands (e.g., `git status` -> `rtk git status`) before execution. Claude never sees the rewrite, it just gets compressed output.
+The hook transparently rewrites shell commands (for Bash, or PowerShell when Claude Code is configured to use the PowerShell tool) before execution. Claude never sees the rewrite, it just gets compressed output.
 
-**Important:** the hook only runs on Bash tool calls. Claude Code built-in tools like `Read`, `Grep`, and `Glob` do not pass through the Bash hook, so they are not auto-rewritten. To get RTK's compact output for those workflows, use shell commands (`cat`/`head`/`tail`, `rg`/`grep`, `find`) or call `rtk read`, `rtk grep`, or `rtk find` directly.
+**Important:** the hook only runs on Claude Code shell tool calls (`Bash` or `PowerShell`). Built-in tools like `Read`, `Grep`, and `Glob` do not pass through the hook, so they are not auto-rewritten. To get RTK's compact output for those workflows, use shell commands (`cat`/`head`/`tail`, `rg`/`grep`, `find`) or call `rtk read`, `rtk grep`, or `rtk find` directly.
 
 ## How It Works
 
@@ -241,6 +241,8 @@ rtk summary <long command>      # Heuristic summary
 rtk proxy <command>             # Raw passthrough + tracking
 ```
 
+On native Windows, `rtk proxy` can only launch real executables. PowerShell aliases and shell built-ins such as `dir` or `echo` are not standalone programs, so run them directly in the shell instead of through `rtk proxy`.
+
 ### Token Savings Analytics
 ```bash
 rtk gain                        # Summary stats
@@ -254,6 +256,8 @@ rtk discover --all --since 7    # All projects, last 7 days
 
 rtk session                     # Show RTK adoption across recent sessions
 ```
+
+`rtk discover` and `rtk session` read Claude Code history from `~/.claude/projects`, so they only return data after Claude Code has been used locally at least once.
 
 ## Global Flags
 
@@ -327,13 +331,18 @@ rtk init -g
 
 ### Native Windows (limited support)
 
-On native Windows (cmd.exe / PowerShell), RTK filters work but the hook does not auto-rewrite commands:
+On native Windows (cmd.exe / PowerShell), RTK filters work. Claude Code auto-rewrite depends on which shell tool Claude is using:
 
 ```powershell
 # 1. Download and extract rtk-x86_64-pc-windows-msvc.zip from releases
 # 2. Add rtk.exe to your PATH
-# 3. Initialize (falls back to CLAUDE.md injection)
+# 3a. Claude Code Bash tool / generic fallback
 rtk init -g
+# 3b. Claude Code PowerShell tool
+# Enable Claude Code's PowerShell tool first:
+$env:CLAUDE_CODE_USE_POWERSHELL_TOOL = "1"
+# Then install the PowerShell hook:
+rtk init -g --shell powershell
 # 4. Use rtk explicitly
 rtk cargo test
 rtk git status
@@ -341,11 +350,20 @@ rtk git status
 
 **Important**: Do not double-click `rtk.exe` — it is a CLI tool that prints usage and exits immediately. Always run it from a terminal (Command Prompt, PowerShell, or Windows Terminal).
 
+If `CLAUDE_CODE_USE_POWERSHELL_TOOL` is not set, Claude Code continues using its Bash tool and the PowerShell-specific hook will not run.
+
+Native Windows caveats:
+
+1. `rtk ls` and `rtk wc` need real `ls` / `wc` executables on `PATH`. In plain PowerShell, prefer `rtk tree .`, `Get-ChildItem`, or `Measure-Object`, or run RTK from WSL / Git Bash.
+2. `rtk proxy` only works with real executables, not aliases or shell built-ins such as `dir` and `echo`.
+3. `rtk discover` and `rtk session` require Claude Code history under `~/.claude/projects`.
+4. `rtk curl` may still be affected by local Windows TLS / certificate policy outside RTK itself.
+
 | Feature | WSL | Native Windows |
 |---------|-----|----------------|
 | Filters (cargo, git, etc.) | Full | Full |
-| Auto-rewrite hook | Yes | No (CLAUDE.md fallback) |
-| `rtk init -g` | Hook mode | CLAUDE.md mode |
+| Auto-rewrite hook | Yes | Bash fallback or PowerShell hook |
+| `rtk init -g` | Hook mode | Bash fallback / PowerShell hook |
 | `rtk gain` / analytics | Full | Full |
 
 ## Supported AI Tools
@@ -354,9 +372,9 @@ RTK supports 12 AI coding tools. Each integration transparently rewrites shell c
 
 | Tool | Install | Method |
 |------|---------|--------|
-| **Claude Code** | `rtk init -g` | PreToolUse hook (bash) |
-| **GitHub Copilot (VS Code)** | `rtk init -g --copilot` | PreToolUse hook — transparent rewrite |
-| **GitHub Copilot CLI** | `rtk init -g --copilot` | PreToolUse deny-with-suggestion (CLI limitation) |
+| **Claude Code** | `rtk init -g` or `rtk init -g --shell powershell` | PreToolUse hook (Bash or PowerShell; Windows PowerShell hook matches both) |
+| **GitHub Copilot (VS Code)** | `rtk init --copilot` | PreToolUse hook — transparent rewrite |
+| **GitHub Copilot CLI** | `rtk init --copilot` | PreToolUse deny-with-suggestion (CLI limitation) |
 | **Cursor** | `rtk init -g --agent cursor` | preToolUse hook (hooks.json) |
 | **Gemini CLI** | `rtk init -g --gemini` | BeforeTool hook |
 | **Codex** | `rtk init -g --codex` | AGENTS.md + RTK.md instructions |
