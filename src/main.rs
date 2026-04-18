@@ -726,6 +726,9 @@ enum Commands {
     /// Used by Claude Code, Gemini CLI, and other LLM hooks:
     ///   REWRITTEN=$(rtk rewrite "$CMD") || exit 0
     Rewrite {
+        /// Target shell for shell-specific rewrites
+        #[arg(long, value_enum)]
+        shell: Option<ShellTarget>,
         /// Raw command to rewrite (e.g. "git status", "cargo test && git push")
         /// Accepts multiple args: `rtk rewrite ls -al` is equivalent to `rtk rewrite "ls -al"`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -2130,9 +2133,13 @@ fn run_cli() -> Result<i32> {
             }
         },
 
-        Commands::Rewrite { args } => {
+        Commands::Rewrite { shell, args } => {
             let cmd = args.join(" ");
-            hooks::rewrite_cmd::run(&cmd)?;
+            let rewrite_shell = match shell {
+                Some(ShellTarget::Powershell) => discover::registry::RewriteShell::PowerShell,
+                None => discover::registry::RewriteShell::Posix,
+            };
+            hooks::rewrite_cmd::run(&cmd, rewrite_shell)?;
             0
         }
 
@@ -2832,7 +2839,7 @@ mod tests {
             );
             if let Ok(cli) = result {
                 match cli.command {
-                    Commands::Rewrite { ref args } => {
+                    Commands::Rewrite { ref args, .. } => {
                         assert!(args.len() >= 2, "rewrite args should capture all tokens");
                     }
                     _ => panic!("expected Rewrite command"),
@@ -2848,13 +2855,19 @@ mod tests {
         assert!(result.is_ok());
         if let Ok(cli) = result {
             match cli.command {
-                Commands::Rewrite { ref args } => {
+                Commands::Rewrite { ref args, .. } => {
                     assert_eq!(args.len(), 1);
                     assert_eq!(args[0], "git status");
                 }
                 _ => panic!("expected Rewrite command"),
             }
         }
+    }
+
+    #[test]
+    fn test_rewrite_clap_shell_powershell_parses() {
+        let result = Cli::try_parse_from(["rtk", "rewrite", "--shell", "powershell", "ls", "-la"]);
+        assert!(result.is_ok());
     }
 
     #[test]

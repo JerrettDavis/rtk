@@ -66,7 +66,7 @@ if ($CMD -eq 'ls' -or $CMD -match '^ls\s+') {
 }
 
 # Delegate all rewrite + permission logic to the Rust binary.
-$REWRITTEN = (& rtk rewrite "$CMD" 2>$null) -join "`n"
+$REWRITTEN = (& rtk rewrite --shell powershell "$CMD" 2>$null) -join "`n"
 $ExitCode = $LASTEXITCODE
 
 switch ($ExitCode) {

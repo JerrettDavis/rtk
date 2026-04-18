@@ -1,7 +1,7 @@
 //! Translates a raw shell command into its RTK-optimized equivalent.
 
 use super::permissions::{check_command, PermissionVerdict};
-use crate::discover::registry;
+use crate::discover::registry::{self, RewriteShell};
 use std::io::Write;
 
 /// Run the `rtk rewrite` command.
@@ -15,7 +15,7 @@ use std::io::Write;
 /// | 1    | (none)   | No RTK equivalent — hook passes through unchanged.           |
 /// | 2    | (none)   | Deny rule matched — hook defers to Claude Code native deny.  |
 /// | 3    | rewritten| Ask rule matched — hook rewrites but lets Claude Code prompt.|
-pub fn run(cmd: &str) -> anyhow::Result<()> {
+pub fn run(cmd: &str, shell: RewriteShell) -> anyhow::Result<()> {
     let excluded = crate::core::config::Config::load()
         .map(|c| c.hooks.exclude_commands)
         .unwrap_or_default();
@@ -27,7 +27,7 @@ pub fn run(cmd: &str) -> anyhow::Result<()> {
         std::process::exit(2);
     }
 
-    match registry::rewrite_command(cmd, &excluded) {
+    match registry::rewrite_command_for_shell(cmd, &excluded, shell) {
         Some(rewritten) => match verdict {
             PermissionVerdict::Allow => {
                 print!("{}", rewritten);

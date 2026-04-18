@@ -2965,6 +2965,7 @@ mod tests {
     fn test_powershell_hook_has_guards() {
         assert!(REWRITE_HOOK_PS1.contains("Get-Command rtk"));
         assert!(REWRITE_HOOK_PS1.contains("rtk --version"));
+        assert!(REWRITE_HOOK_PS1.contains("--shell powershell"));
         let version_check_pos = REWRITE_HOOK_PS1.find("rtk --version").unwrap();
         let rewrite_pos = REWRITE_HOOK_PS1.find("& rtk rewrite").unwrap();
         assert!(
