@@ -19,8 +19,8 @@ use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd};
 use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::system::{
-    deps, env_cmd, find_cmd, format_cmd, grep_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd,
-    read, summary, tree, wc_cmd,
+    deps, echo, env_cmd, find_cmd, format_cmd, grep_cmd, json_cmd, local_llm, log_cmd, ls,
+    pipe_cmd, read, summary, tree, wc_cmd,
 };
 
 use anyhow::{Context, Result};
@@ -51,6 +51,12 @@ pub enum AgentTarget {
 pub enum ShellTarget {
     /// Claude Code PowerShell tool (Windows / CLAUDE_CODE_USE_POWERSHELL_TOOL=1)
     Powershell,
+    /// PowerShell Core
+    Pwsh,
+    /// Windows Command Prompt
+    Cmd,
+    /// POSIX-style shells such as bash
+    Bash,
 }
 
 #[derive(Parser)]
@@ -82,6 +88,13 @@ enum Commands {
     /// List directory contents with token-optimized output (proxy to native ls)
     Ls {
         /// Arguments passed to ls (supports all native ls flags like -l, -a, -h, -R)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Echo text while keeping shell builtin rewrites inside RTK
+    Echo {
+        /// Arguments passed to echo
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -1279,10 +1292,10 @@ fn shell_split(input: &str) -> Vec<String> {
 fn proxy_windows_builtin_hint(command: &str) -> Option<&'static str> {
     match command.to_ascii_lowercase().as_str() {
         "dir" => Some(
-            "`rtk proxy` requires a real executable. In PowerShell, `dir` is an alias for `Get-ChildItem`, not a standalone program.\nUse `Get-ChildItem` directly, run `rtk tree .`, or proxy a real executable instead.",
+            "`rtk proxy` requires a real executable. `dir` is shell-native on Windows, not a standalone program.\nRun `rtk run -c \"dir\"` to keep RTK filtering, or proxy a real executable instead.",
         ),
         "echo" => Some(
-            "`rtk proxy` requires a real executable. In PowerShell and cmd.exe, `echo` is a shell builtin, not a standalone program.\nRun it directly in your shell, or proxy a real executable instead.",
+            "`rtk proxy` requires a real executable. `echo` is a shell builtin in PowerShell, cmd.exe, and bash.\nUse `rtk echo ...` or `rtk run -c \"echo ...\"` instead.",
         ),
         _ => None,
     }
@@ -1369,6 +1382,8 @@ fn run_cli() -> Result<i32> {
 
     let code = match cli.command {
         Commands::Ls { args } => ls::run(&args, cli.verbose)?,
+
+        Commands::Echo { args } => echo::run(&args, cli.verbose)?,
 
         Commands::Tree { args } => tree::run(&args, cli.verbose)?,
 
@@ -1770,7 +1785,7 @@ fn run_cli() -> Result<i32> {
                     );
                 }
                 hooks::init::run_antigravity_mode(cli.verbose)?;
-            } else if shell == Some(ShellTarget::Powershell) {
+            } else if matches!(shell, Some(ShellTarget::Powershell | ShellTarget::Pwsh)) {
                 let patch_mode = if auto_patch {
                     hooks::init::PatchMode::Auto
                 } else if no_patch {
@@ -2136,8 +2151,11 @@ fn run_cli() -> Result<i32> {
         Commands::Rewrite { shell, args } => {
             let cmd = args.join(" ");
             let rewrite_shell = match shell {
-                Some(ShellTarget::Powershell) => discover::registry::RewriteShell::PowerShell,
-                None => discover::registry::RewriteShell::Posix,
+                Some(ShellTarget::Powershell | ShellTarget::Pwsh) => {
+                    discover::registry::RewriteShell::PowerShell
+                }
+                Some(ShellTarget::Cmd) => discover::registry::RewriteShell::Cmd,
+                Some(ShellTarget::Bash) | None => discover::registry::RewriteShell::Posix,
             };
             hooks::rewrite_cmd::run(&cmd, rewrite_shell)?;
             0
@@ -2397,6 +2415,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
     matches!(
         cmd,
         Commands::Ls { .. }
+            | Commands::Echo { .. }
             | Commands::Tree { .. }
             | Commands::Read { .. }
             | Commands::Smart { .. }
@@ -2808,8 +2827,8 @@ mod tests {
     #[test]
     fn test_proxy_windows_builtin_hint_for_dir() {
         let hint = proxy_windows_builtin_hint("dir").expect("dir should have a Windows hint");
-        assert!(hint.contains("Get-ChildItem"));
-        assert!(hint.contains("rtk tree ."));
+        assert!(hint.contains("rtk run -c"));
+        assert!(hint.contains("dir"));
     }
 
     #[test]
@@ -2867,6 +2886,24 @@ mod tests {
     #[test]
     fn test_rewrite_clap_shell_powershell_parses() {
         let result = Cli::try_parse_from(["rtk", "rewrite", "--shell", "powershell", "ls", "-la"]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rewrite_clap_shell_pwsh_parses() {
+        let result = Cli::try_parse_from(["rtk", "rewrite", "--shell", "pwsh", "ls", "-Force"]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rewrite_clap_shell_cmd_parses() {
+        let result = Cli::try_parse_from(["rtk", "rewrite", "--shell", "cmd", "dir", "/a"]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rewrite_clap_shell_bash_parses() {
+        let result = Cli::try_parse_from(["rtk", "rewrite", "--shell", "bash", "ls", "-la"]);
         assert!(result.is_ok());
     }
 

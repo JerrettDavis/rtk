@@ -555,7 +555,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "Get-ChildItem -Force");
+        assert_eq!(cmd, "rtk ls -la");
     }
 
     #[test]

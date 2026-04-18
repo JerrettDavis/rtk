@@ -7,13 +7,15 @@
 /// - `wc -c file.py`  → `978`
 /// - `wc -l *.py`     → table with common path prefix stripped
 use crate::core::runner::{self, RunOptions};
+use crate::core::tracking::TimedExecution;
 use crate::core::utils::resolved_command;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::fs;
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     #[cfg(target_os = "windows")]
     if crate::core::utils::resolve_binary("wc").is_err() {
-        anyhow::bail!("{}", windows_wc_unavailable_message());
+        return run_windows_wc(args, verbose);
     }
 
     let mut cmd = resolved_command("wc");
@@ -36,7 +38,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 fn windows_wc_unavailable_message() -> &'static str {
-    "`rtk wc` requires a real `wc` executable on PATH. Native PowerShell does not ship one by default.\nUse `Measure-Object -Line -Word -Character`, install a Unix-compatible `wc`, or run the command from WSL/Git Bash."
+    "`rtk wc` falls back to native Windows counting when no standalone `wc` executable is available. PowerShell and cmd-native rewrites still flow through RTK compression."
 }
 
 /// Which columns the user requested
@@ -54,6 +56,14 @@ enum WcMode {
     Chars,
     /// Multiple flags combined — keep compact format
     Mixed,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct WcStats {
+    lines: usize,
+    words: usize,
+    bytes: usize,
+    chars: usize,
 }
 
 fn detect_mode(args: &[String]) -> WcMode {
@@ -115,6 +125,107 @@ fn detect_mode(args: &[String]) -> WcMode {
         WcMode::Chars
     } else {
         WcMode::Full
+    }
+}
+
+fn run_windows_wc(args: &[String], verbose: u8) -> Result<i32> {
+    let timer = TimedExecution::start();
+    let output = render_windows_wc(args)?;
+
+    if verbose > 0 {
+        eprintln!("Running Windows-native wc fallback");
+    }
+
+    print!("{output}");
+
+    let original_cmd = if args.is_empty() {
+        "wc".to_string()
+    } else {
+        format!("wc {}", args.join(" "))
+    };
+    let rtk_cmd = if args.is_empty() {
+        "rtk wc".to_string()
+    } else {
+        format!("rtk wc {}", args.join(" "))
+    };
+    timer.track(&original_cmd, &rtk_cmd, &output, &output);
+    Ok(0)
+}
+
+fn render_windows_wc(args: &[String]) -> Result<String> {
+    let mode = detect_mode(args);
+    let paths = extract_wc_paths(args);
+    if paths.is_empty() {
+        anyhow::bail!("{}", windows_wc_unavailable_message());
+    }
+
+    let mut rows = Vec::new();
+    let mut total = WcStats::default();
+
+    for path in &paths {
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path))?;
+        let stats = count_wc_stats(&bytes);
+        total.lines += stats.lines;
+        total.words += stats.words;
+        total.bytes += stats.bytes;
+        total.chars += stats.chars;
+        rows.push((stats, path.clone()));
+    }
+
+    if rows.len() == 1 {
+        return Ok(format_single_wc_stats(rows[0].0, &mode));
+    }
+
+    let mut rendered = rows
+        .into_iter()
+        .map(|(stats, path)| format!("{} {}", format_single_wc_stats(stats, &mode), path))
+        .collect::<Vec<_>>();
+    rendered.push(format!("Σ {}", format_single_wc_stats(total, &mode)));
+    Ok(rendered.join("\n"))
+}
+
+fn extract_wc_paths(args: &[String]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut parsing_options = true;
+
+    for arg in args {
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            continue;
+        }
+
+        if parsing_options && arg.starts_with('-') {
+            continue;
+        }
+
+        parsing_options = false;
+        paths.push(arg.clone());
+    }
+
+    paths
+}
+
+fn count_wc_stats(bytes: &[u8]) -> WcStats {
+    let text = String::from_utf8_lossy(bytes);
+    WcStats {
+        lines: bytes.iter().filter(|byte| **byte == b'\n').count(),
+        words: text.split_whitespace().count(),
+        bytes: bytes.len(),
+        chars: text.chars().count(),
+    }
+}
+
+fn format_single_wc_stats(stats: WcStats, mode: &WcMode) -> String {
+    match mode {
+        WcMode::Lines => stats.lines.to_string(),
+        WcMode::Words => stats.words.to_string(),
+        WcMode::Bytes => stats.bytes.to_string(),
+        WcMode::Chars => stats.chars.to_string(),
+        WcMode::Full => format!("{}L {}W {}B", stats.lines, stats.words, stats.bytes),
+        WcMode::Mixed => format!(
+            "{} {} {} {}",
+            stats.lines, stats.words, stats.bytes, stats.chars
+        ),
     }
 }
 
@@ -386,9 +497,18 @@ mod tests {
     }
 
     #[test]
-    fn test_windows_wc_unavailable_message_mentions_measure_object() {
+    fn test_windows_wc_unavailable_message_mentions_native_fallback() {
         let message = windows_wc_unavailable_message();
-        assert!(message.contains("Measure-Object"));
-        assert!(message.contains("WSL/Git Bash"));
+        assert!(message.contains("native Windows counting"));
+        assert!(message.contains("RTK compression"));
+    }
+
+    #[test]
+    fn test_windows_wc_fallback_counts_lines() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), "one\ntwo\nthree\n").unwrap();
+        let args = vec!["-l".to_string(), temp.path().display().to_string()];
+        let result = render_windows_wc(&args).unwrap();
+        assert_eq!(result, "3");
     }
 }

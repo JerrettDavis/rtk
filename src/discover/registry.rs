@@ -25,6 +25,7 @@ pub enum Classification {
 pub enum RewriteShell {
     Posix,
     PowerShell,
+    Cmd,
 }
 
 /// Average token counts per category for estimation when no output_len available.
@@ -679,10 +680,8 @@ fn rewrite_segment_inner(
         return None;
     }
 
-    if shell == RewriteShell::PowerShell {
-        if let Some(rewritten) = rewrite_powershell_builtin(cmd_clean) {
-            return Some(format!("{}{}{}", env_prefix, rewritten, redirect_suffix));
-        }
+    if let Some(rewritten) = rewrite_shell_builtin(cmd_clean, shell) {
+        return Some(format!("{}{}{}", env_prefix, rewritten, redirect_suffix));
     }
 
     // Use classify_command for correct ignore/prefix handling
@@ -740,7 +739,7 @@ fn rewrite_segment_inner(
     None
 }
 
-fn rewrite_powershell_builtin(cmd: &str) -> Option<String> {
+fn rewrite_shell_builtin(cmd: &str, shell: RewriteShell) -> Option<String> {
     let tokens = tokenize(cmd);
     let first = tokens.first()?;
     if first.kind != TokenKind::Arg {
@@ -748,9 +747,16 @@ fn rewrite_powershell_builtin(cmd: &str) -> Option<String> {
     }
 
     match first.value.to_ascii_lowercase().as_str() {
-        "ls" | "dir" => Some(rewrite_powershell_get_child_item(&tokens)),
-        "echo" => Some(replace_leading_command(cmd, &tokens, "Write-Output")),
-        "wc" => rewrite_powershell_wc(&tokens),
+        "ls" if shell == RewriteShell::PowerShell || shell == RewriteShell::Cmd => {
+            Some(rewrite_shell_ls(&tokens, "rtk ls", shell))
+        }
+        "dir" if shell == RewriteShell::PowerShell || shell == RewriteShell::Cmd => {
+            Some(rewrite_shell_ls(&tokens, "rtk ls", shell))
+        }
+        "echo" => Some(replace_leading_command(cmd, &tokens, "rtk echo")),
+        "wc" if shell == RewriteShell::PowerShell || shell == RewriteShell::Cmd => {
+            Some(replace_leading_command(cmd, &tokens, "rtk wc"))
+        }
         _ => None,
     }
 }
@@ -769,14 +775,14 @@ fn push_unique_arg(args: &mut Vec<String>, value: &str) {
     }
 }
 
-fn rewrite_powershell_get_child_item(tokens: &[ParsedToken]) -> String {
+fn rewrite_shell_ls(tokens: &[ParsedToken], command: &str, shell: RewriteShell) -> String {
     let mut translated = Vec::new();
-    let mut passthrough = Vec::new();
+    let mut paths = Vec::new();
     let mut parsing_options = true;
 
     for token in tokens.iter().skip(1) {
         if token.kind != TokenKind::Arg {
-            passthrough.push(token.value.clone());
+            paths.push(token.value.clone());
             continue;
         }
 
@@ -788,84 +794,33 @@ fn rewrite_powershell_get_child_item(tokens: &[ParsedToken]) -> String {
 
         if parsing_options && arg.starts_with("--") {
             match arg {
-                "--all" => push_unique_arg(&mut translated, "-Force"),
-                "--recursive" => push_unique_arg(&mut translated, "-Recurse"),
+                "--all" => push_unique_arg(&mut translated, "--all"),
+                "--recursive" => push_unique_arg(&mut translated, "--recursive"),
                 "--long" | "--human-readable" => {}
-                _ => passthrough.push(arg.to_string()),
+                _ => translated.push(arg.to_string()),
+            }
+            continue;
+        }
+
+        if parsing_options && shell == RewriteShell::Cmd && arg.starts_with('/') && arg.len() > 1 {
+            match arg[1..].to_ascii_lowercase().as_str() {
+                "a" => push_unique_arg(&mut translated, "--all"),
+                "s" => push_unique_arg(&mut translated, "--recursive"),
+                _ => translated.push(arg.to_string()),
             }
             continue;
         }
 
         if parsing_options && arg.starts_with('-') && arg.len() > 1 {
-            let mut unknown_flags = String::new();
-            for ch in arg.chars().skip(1) {
-                match ch {
-                    'a' => push_unique_arg(&mut translated, "-Force"),
-                    'R' => push_unique_arg(&mut translated, "-Recurse"),
-                    'l' | 'h' | '1' => {}
-                    _ => unknown_flags.push(ch),
-                }
+            if shell == RewriteShell::PowerShell && arg.eq_ignore_ascii_case("-force") {
+                push_unique_arg(&mut translated, "--all");
+                continue;
             }
-            if !unknown_flags.is_empty() {
-                passthrough.push(format!("-{}", unknown_flags));
+            if shell == RewriteShell::PowerShell && arg.eq_ignore_ascii_case("-recurse") {
+                push_unique_arg(&mut translated, "--recursive");
+                continue;
             }
-            continue;
-        }
-
-        parsing_options = false;
-        passthrough.push(arg.to_string());
-    }
-
-    let mut rewritten = vec!["Get-ChildItem".to_string()];
-    rewritten.extend(translated);
-    rewritten.extend(passthrough);
-    rewritten.join(" ")
-}
-
-fn rewrite_powershell_wc(tokens: &[ParsedToken]) -> Option<String> {
-    let mut measure_switches = Vec::new();
-    let mut paths = Vec::new();
-    let mut parsing_options = true;
-    let mut byte_count_only = false;
-
-    for token in tokens.iter().skip(1) {
-        if token.kind != TokenKind::Arg {
-            return None;
-        }
-
-        let arg = token.value.as_str();
-        if parsing_options && arg == "--" {
-            parsing_options = false;
-            continue;
-        }
-
-        if parsing_options && arg.starts_with('-') && arg.len() > 1 {
-            let mut saw_supported_flag = false;
-            for ch in arg.chars().skip(1) {
-                match ch {
-                    'l' => {
-                        push_unique_arg(&mut measure_switches, "-Line");
-                        saw_supported_flag = true;
-                    }
-                    'w' => {
-                        push_unique_arg(&mut measure_switches, "-Word");
-                        saw_supported_flag = true;
-                    }
-                    'm' => {
-                        push_unique_arg(&mut measure_switches, "-Character");
-                        saw_supported_flag = true;
-                    }
-                    'c' => {
-                        byte_count_only = true;
-                        saw_supported_flag = true;
-                    }
-                    _ => return None,
-                }
-            }
-
-            if byte_count_only && (!saw_supported_flag || !measure_switches.is_empty()) {
-                return None;
-            }
+            translated.push(arg.to_string());
             continue;
         }
 
@@ -873,31 +828,10 @@ fn rewrite_powershell_wc(tokens: &[ParsedToken]) -> Option<String> {
         paths.push(arg.to_string());
     }
 
-    if paths.is_empty() {
-        return None;
-    }
-
-    let path_expr = paths.join(" ");
-    if byte_count_only {
-        return Some(format!(
-            "Get-Item {} | Measure-Object -Property Length -Sum",
-            path_expr
-        ));
-    }
-
-    if measure_switches.is_empty() {
-        measure_switches.extend(
-            ["-Line", "-Word", "-Character"]
-                .into_iter()
-                .map(str::to_string),
-        );
-    }
-
-    Some(format!(
-        "Get-Content {} | Measure-Object {}",
-        path_expr,
-        measure_switches.join(" ")
-    ))
+    let mut rewritten = vec![command.to_string()];
+    rewritten.extend(translated);
+    rewritten.extend(paths);
+    rewritten.join(" ")
 }
 
 /// Strip a command prefix with word-boundary check.
@@ -1727,7 +1661,7 @@ mod tests {
     fn test_rewrite_redirect_2_gt_amp_1_with_and() {
         assert_eq!(
             rewrite_command("cargo test 2>&1 && echo done", &[]),
-            Some("rtk cargo test 2>&1 && echo done".into())
+            Some("rtk cargo test 2>&1 && rtk echo done".into())
         );
     }
 
@@ -3465,34 +3399,50 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_powershell_ls_to_get_child_item() {
+    fn test_rewrite_powershell_ls_to_rtk_ls() {
         assert_eq!(
             rewrite_command_for_shell("ls -la src", &[], RewriteShell::PowerShell),
-            Some("Get-ChildItem -Force src".into())
+            Some("rtk ls -la src".into())
         );
     }
 
     #[test]
-    fn test_rewrite_powershell_dir_to_get_child_item() {
+    fn test_rewrite_powershell_dir_to_rtk_ls() {
         assert_eq!(
             rewrite_command_for_shell("dir src", &[], RewriteShell::PowerShell),
-            Some("Get-ChildItem src".into())
+            Some("rtk ls src".into())
         );
     }
 
     #[test]
-    fn test_rewrite_powershell_echo_to_write_output() {
+    fn test_rewrite_powershell_echo_to_rtk_echo() {
         assert_eq!(
             rewrite_command_for_shell(r#"echo "hello world""#, &[], RewriteShell::PowerShell),
-            Some(r#"Write-Output "hello world""#.into())
+            Some(r#"rtk echo "hello world""#.into())
         );
     }
 
     #[test]
-    fn test_rewrite_powershell_wc_to_measure_object() {
+    fn test_rewrite_bash_echo_to_rtk_echo() {
+        assert_eq!(
+            rewrite_command_for_shell(r#"echo "hello world""#, &[], RewriteShell::Posix),
+            Some(r#"rtk echo "hello world""#.into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_powershell_wc_to_rtk_wc() {
         assert_eq!(
             rewrite_command_for_shell("wc -l README.md", &[], RewriteShell::PowerShell),
-            Some("Get-Content README.md | Measure-Object -Line".into())
+            Some("rtk wc -l README.md".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_powershell_dir_force_to_rtk_ls_all() {
+        assert_eq!(
+            rewrite_command_for_shell("dir -Force src", &[], RewriteShell::PowerShell),
+            Some("rtk ls --all src".into())
         );
     }
 
@@ -3504,7 +3454,15 @@ mod tests {
                 &[],
                 RewriteShell::PowerShell
             ),
-            Some("rtk git status && Get-ChildItem -Force && Write-Output done".into())
+            Some("rtk git status && rtk ls -a && rtk echo done".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_cmd_dir_flag_to_rtk_ls() {
+        assert_eq!(
+            rewrite_command_for_shell("dir /a src", &[], RewriteShell::Cmd),
+            Some("rtk ls --all src".into())
         );
     }
 }

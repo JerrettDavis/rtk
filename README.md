@@ -115,7 +115,7 @@ rtk init --agent antigravity    # Google Antigravity
 git status  # Automatically rewritten to rtk git status
 ```
 
-The hook transparently rewrites shell commands (for Bash, or PowerShell when Claude Code is configured to use the PowerShell tool) before execution. On the PowerShell path, common Unix-style commands such as `ls`, `dir`, `echo`, and `wc` are translated to native PowerShell equivalents before execution. Claude never sees the rewrite, it just gets compressed output.
+The hook transparently rewrites shell commands (for Bash, cmd.exe, pwsh, or PowerShell when Claude Code is configured to use the PowerShell tool) before execution. Shell-native commands such as `ls`, `dir`, `echo`, and `wc` are routed back through RTK (`rtk ls`, `rtk echo`, `rtk wc`) so they still get the normal compact output instead of bypassing RTK.
 
 **Important:** the hook only runs on Claude Code shell tool calls (`Bash` or `PowerShell`). Built-in tools like `Read`, `Grep`, and `Glob` do not pass through the hook, so they are not auto-rewritten. To get RTK's compact output for those workflows, use shell commands (`cat`/`head`/`tail`, `rg`/`grep`, `find`) or call `rtk read`, `rtk grep`, or `rtk find` directly.
 
@@ -241,7 +241,7 @@ rtk summary <long command>      # Heuristic summary
 rtk proxy <command>             # Raw passthrough + tracking
 ```
 
-On native Windows, `rtk proxy` can only launch real executables. PowerShell aliases and shell built-ins such as `dir` or `echo` are not standalone programs, so run them directly in the shell instead of through `rtk proxy`.
+On native Windows, `rtk proxy` can only launch real executables. Shell-native commands such as `dir` or `echo` should go through `rtk run -c "..."` or the regular hook rewrite path instead of `rtk proxy`.
 
 ### Token Savings Analytics
 ```bash
@@ -354,8 +354,8 @@ If `CLAUDE_CODE_USE_POWERSHELL_TOOL` is not set, Claude Code continues using its
 
 Native Windows caveats:
 
-1. `rtk ls` and `rtk wc` still need real `ls` / `wc` executables on `PATH`. The PowerShell hook rewrites raw `ls` / `dir` / `echo` / `wc` commands to native PowerShell equivalents, but explicit `rtk ls` and `rtk wc` invocations still require those underlying executables.
-2. `rtk proxy` only works with real executables, not aliases or shell built-ins such as `dir` and `echo`.
+1. `rtk ls`, `rtk wc`, and `rtk echo` now work on native Windows even when `ls` / `wc` are not installed, and the rewrite path understands `cmd`, `pwsh`, `powershell`, and `bash`.
+2. `rtk proxy` still only works with real executables, not aliases or shell built-ins such as `dir` and `echo`.
 3. `rtk discover` and `rtk session` require Claude Code history under `~/.claude/projects`.
 4. `rtk curl` may still be affected by local Windows TLS / certificate policy outside RTK itself.
 

@@ -2,11 +2,15 @@
 
 use super::constants::NOISE_DIRS;
 use crate::core::runner::{self, RunOptions};
+use crate::core::tracking::TimedExecution;
 use crate::core::utils::resolved_command;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use lazy_static::lazy_static;
 use regex::Regex;
+use std::fs;
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 lazy_static! {
     /// Matches the date+time portion in `ls -la` output, which serves as a
@@ -19,58 +23,36 @@ lazy_static! {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    let request = normalize_ls_args(args);
+
     #[cfg(target_os = "windows")]
     if crate::core::utils::resolve_binary("ls").is_err() {
-        anyhow::bail!("{}", windows_ls_unavailable_message());
+        return run_windows_ls(args, &request, verbose);
     }
-
-    let show_all = args
-        .iter()
-        .any(|a| (a.starts_with('-') && !a.starts_with("--") && a.contains('a')) || a == "--all");
-
-    let flags: Vec<&str> = args
-        .iter()
-        .filter(|a| a.starts_with('-'))
-        .map(|s| s.as_str())
-        .collect();
-    let paths: Vec<&str> = args
-        .iter()
-        .filter(|a| !a.starts_with('-'))
-        .map(|s| s.as_str())
-        .collect();
 
     let mut cmd = resolved_command("ls");
     cmd.arg("-la");
-    for flag in &flags {
-        if flag.starts_with("--") {
-            if *flag != "--all" {
-                cmd.arg(flag);
-            }
-        } else {
-            let stripped = flag.trim_start_matches('-');
-            let extra: String = stripped
-                .chars()
-                .filter(|c| *c != 'l' && *c != 'a' && *c != 'h')
-                .collect();
-            if !extra.is_empty() {
-                cmd.arg(format!("-{}", extra));
-            }
-        }
+    if request.recursive {
+        cmd.arg("-R");
+    }
+    for flag in &request.passthrough_flags {
+        cmd.arg(flag);
     }
 
-    if paths.is_empty() {
+    if request.paths.is_empty() {
         cmd.arg(".");
     } else {
-        for p in &paths {
+        for p in &request.paths {
             cmd.arg(p);
         }
     }
 
-    let target_display = if paths.is_empty() {
+    let target_display = if request.paths.is_empty() {
         ".".to_string()
     } else {
-        paths.join(" ")
+        request.paths.join(" ")
     };
+    let show_all = request.show_all;
 
     runner::run_filtered(
         cmd,
@@ -107,8 +89,295 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn windows_ls_unavailable_message() -> &'static str {
-    "`rtk ls` requires a real `ls` executable on PATH. In native PowerShell, `ls` is usually an alias for `Get-ChildItem`, not a standalone program.\nUse `rtk tree .`, run `Get-ChildItem` directly, or install a Unix-compatible `ls`."
+    "`rtk ls` can translate PowerShell and cmd flags on Windows. Supported native aliases include `ls -Force`, `dir /a`, and `dir /s`, all routed through RTK compression."
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct LsRequest {
+    show_all: bool,
+    recursive: bool,
+    paths: Vec<String>,
+    passthrough_flags: Vec<String>,
+}
+
+#[derive(Debug)]
+struct LsEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+fn normalize_ls_args(args: &[String]) -> LsRequest {
+    let mut request = LsRequest::default();
+    let mut parsing_options = true;
+
+    for arg in args {
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            continue;
+        }
+
+        if parsing_options && arg.starts_with("--") {
+            match arg.as_str() {
+                "--all" => request.show_all = true,
+                "--recursive" => request.recursive = true,
+                "--long" | "--human-readable" => {}
+                _ => request.passthrough_flags.push(arg.clone()),
+            }
+            continue;
+        }
+
+        if parsing_options && arg.starts_with('/') && arg.len() > 1 {
+            match arg[1..].to_ascii_lowercase().as_str() {
+                "a" => request.show_all = true,
+                "s" => request.recursive = true,
+                _ => request.passthrough_flags.push(arg.clone()),
+            }
+            continue;
+        }
+
+        if parsing_options && arg.starts_with('-') && arg.len() > 1 {
+            if arg.eq_ignore_ascii_case("-force") {
+                request.show_all = true;
+                continue;
+            }
+            if arg.eq_ignore_ascii_case("-recurse") {
+                request.recursive = true;
+                continue;
+            }
+
+            let mut extra = String::new();
+            for ch in arg.chars().skip(1) {
+                match ch {
+                    'a' => request.show_all = true,
+                    'R' => request.recursive = true,
+                    'l' | 'h' | '1' => {}
+                    _ => extra.push(ch),
+                }
+            }
+            if !extra.is_empty() {
+                request.passthrough_flags.push(format!("-{}", extra));
+            }
+            continue;
+        }
+
+        parsing_options = false;
+        request.paths.push(arg.clone());
+    }
+
+    request
+}
+
+fn run_windows_ls(args: &[String], request: &LsRequest, verbose: u8) -> Result<i32> {
+    let timer = TimedExecution::start();
+    let output = render_windows_ls(request)?;
+
+    if verbose > 0 {
+        eprintln!("Running Windows-native ls fallback");
+    }
+
+    print!("{output}");
+
+    let original_cmd = if args.is_empty() {
+        "ls".to_string()
+    } else {
+        format!("ls {}", args.join(" "))
+    };
+    let rtk_cmd = if args.is_empty() {
+        "rtk ls".to_string()
+    } else {
+        format!("rtk ls {}", args.join(" "))
+    };
+    timer.track(&original_cmd, &rtk_cmd, &output, &output);
+    Ok(0)
+}
+
+fn render_windows_ls(request: &LsRequest) -> Result<String> {
+    let mut entries = Vec::new();
+    let targets: Vec<PathBuf> = if request.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        request.paths.iter().map(PathBuf::from).collect()
+    };
+
+    for target in &targets {
+        let metadata = fs::metadata(target)
+            .with_context(|| format!("failed to read metadata for {}", target.display()))?;
+        if metadata.is_dir() {
+            collect_dir_entries(target, request, targets.len() > 1, &mut entries)?;
+        } else {
+            let display_name = normalize_display_path(target);
+            if !should_skip_entry(&display_name, false, &metadata, request.show_all) {
+                entries.push(LsEntry {
+                    name: display_name,
+                    is_dir: false,
+                    size: metadata.len(),
+                });
+            }
+        }
+    }
+
+    let (listing, summary) = format_compact_entries(&entries);
+    let is_tty = std::io::stdout().is_terminal();
+    Ok(if is_tty {
+        format!("{listing}{summary}")
+    } else {
+        listing
+    })
+}
+
+fn collect_dir_entries(
+    root: &Path,
+    request: &LsRequest,
+    multiple_targets: bool,
+    entries: &mut Vec<LsEntry>,
+) -> Result<()> {
+    if request.recursive {
+        for entry in WalkDir::new(root).min_depth(1) {
+            let entry = entry.with_context(|| format!("failed to walk {}", root.display()))?;
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("failed to read metadata for {}", entry.path().display()))?;
+            let display_name = display_entry_name(root, entry.path(), true, multiple_targets);
+            if should_skip_entry(&display_name, metadata.is_dir(), &metadata, request.show_all) {
+                continue;
+            }
+            entries.push(LsEntry {
+                name: display_name,
+                is_dir: metadata.is_dir(),
+                size: metadata.len(),
+            });
+        }
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
+        let entry = entry.with_context(|| format!("failed to read {}", root.display()))?;
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to read metadata for {}", entry.path().display()))?;
+        let display_name = display_entry_name(root, &entry.path(), false, multiple_targets);
+        if should_skip_entry(&display_name, metadata.is_dir(), &metadata, request.show_all) {
+            continue;
+        }
+        entries.push(LsEntry {
+            name: display_name,
+            is_dir: metadata.is_dir(),
+            size: metadata.len(),
+        });
+    }
+
+    Ok(())
+}
+
+fn display_entry_name(root: &Path, path: &Path, recursive: bool, multiple_targets: bool) -> String {
+    if recursive {
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        if multiple_targets && root != Path::new(".") {
+            let root_name = normalize_display_path(root);
+            let rel_name = normalize_display_path(relative);
+            if rel_name.is_empty() {
+                root_name
+            } else {
+                format!("{root_name}/{rel_name}")
+            }
+        } else {
+            normalize_display_path(relative)
+        }
+    } else if multiple_targets {
+        normalize_display_path(path)
+    } else {
+        path.file_name()
+            .map(|name| name.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| normalize_display_path(path))
+    }
+}
+
+fn normalize_display_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn should_skip_entry(name: &str, is_dir: bool, metadata: &fs::Metadata, show_all: bool) -> bool {
+    if show_all {
+        return false;
+    }
+
+    let file_name = Path::new(name)
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+
+    (is_dir && NOISE_DIRS.iter().any(|noise| *noise == file_name))
+        || is_hidden_entry(&file_name, metadata)
+}
+
+#[cfg(target_os = "windows")]
+fn is_hidden_entry(file_name: &str, metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    file_name.starts_with('.') || (metadata.file_attributes() & 0x2) != 0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_hidden_entry(file_name: &str, _metadata: &fs::Metadata) -> bool {
+    file_name.starts_with('.')
+}
+
+fn format_compact_entries(entries: &[LsEntry]) -> (String, String) {
+    use std::collections::HashMap;
+
+    if entries.is_empty() {
+        return ("(empty)\n".to_string(), String::new());
+    }
+
+    let mut dirs: Vec<&LsEntry> = entries.iter().filter(|entry| entry.is_dir).collect();
+    let mut files: Vec<&LsEntry> = entries.iter().filter(|entry| !entry.is_dir).collect();
+    dirs.sort_by(|a, b| a.name.cmp(&b.name));
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut by_ext: HashMap<String, usize> = HashMap::new();
+    for file in &files {
+        let ext = file
+            .name
+            .rsplit_once('.')
+            .map(|(_, ext)| format!(".{ext}"))
+            .unwrap_or_else(|| "no ext".to_string());
+        *by_ext.entry(ext).or_insert(0) += 1;
+    }
+
+    let mut listing = String::new();
+    for dir in &dirs {
+        listing.push_str(&dir.name);
+        listing.push_str("/\n");
+    }
+    for file in &files {
+        listing.push_str(&file.name);
+        listing.push_str("  ");
+        listing.push_str(&human_size(file.size));
+        listing.push('\n');
+    }
+
+    let mut summary = format!("\nSummary: {} files, {} dirs", files.len(), dirs.len());
+    if !by_ext.is_empty() {
+        let mut ext_counts: Vec<_> = by_ext.iter().collect();
+        ext_counts.sort_by(|a, b| b.1.cmp(a.1));
+        let ext_parts: Vec<String> = ext_counts
+            .iter()
+            .take(5)
+            .map(|(ext, count)| format!("{} {}", count, ext))
+            .collect();
+        summary.push_str(" (");
+        summary.push_str(&ext_parts.join(", "));
+        if ext_counts.len() > 5 {
+            summary.push_str(&format!(", +{} more", ext_counts.len() - 5));
+        }
+        summary.push(')');
+    }
+    summary.push('\n');
+
+    (listing, summary)
 }
 
 /// Format bytes into human-readable size
@@ -479,9 +748,22 @@ mod tests {
     }
 
     #[test]
-    fn test_windows_ls_unavailable_message_mentions_powershell_alternatives() {
+    fn test_windows_ls_unavailable_message_mentions_windows_alias_support() {
         let message = windows_ls_unavailable_message();
-        assert!(message.contains("Get-ChildItem"));
-        assert!(message.contains("rtk tree ."));
+        assert!(message.contains("dir /a"));
+        assert!(message.contains("rtk ls"));
+    }
+
+    #[test]
+    fn test_normalize_ls_args_accepts_powershell_and_cmd_flags() {
+        let args = vec![
+            "-Force".to_string(),
+            "/s".to_string(),
+            "src".to_string(),
+        ];
+        let request = normalize_ls_args(&args);
+        assert!(request.show_all);
+        assert!(request.recursive);
+        assert_eq!(request.paths, vec!["src"]);
     }
 }
