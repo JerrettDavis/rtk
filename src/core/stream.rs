@@ -467,15 +467,120 @@ pub(crate) mod tests {
     use super::*;
     use std::process::Command;
 
+    fn command_exit(code: i32) -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", &format!("exit {}", code)]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let program = if code == 0 { "true" } else { "false" };
+            Command::new(program)
+        }
+    }
+
+    fn command_echo(text: &str) -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "echo", text]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("echo");
+            cmd.arg(text);
+            cmd
+        }
+    }
+
+    fn command_stderr(text: &str) -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("powershell");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("[Console]::Error.WriteLine('{}')", text),
+            ]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", &format!("echo {} >&2", text)]);
+            cmd
+        }
+    }
+
+    fn command_combined(stdout_text: &str, stderr_text: &str) -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("powershell");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "[Console]::Out.WriteLine('{}'); [Console]::Error.WriteLine('{}')",
+                    stdout_text, stderr_text
+                ),
+            ]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("sh");
+            cmd.args([
+                "-c",
+                &format!("echo {}; echo {} >&2", stdout_text, stderr_text),
+            ]);
+            cmd
+        }
+    }
+
+    fn command_large_output(to_stderr: bool) -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("powershell");
+            let target = if to_stderr {
+                "[Console]::Error.Write"
+            } else {
+                "[Console]::Out.Write"
+            };
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("$line = ('a' * 80) + \"`n\"; {target}(($line) * 140000)"),
+            ]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("sh");
+            let script = if to_stderr {
+                "dd if=/dev/zero bs=1024 count=11264 2>/dev/null | tr '\\0' 'a' | fold -w 80 1>&2"
+            } else {
+                "dd if=/dev/zero bs=1024 count=11264 2>/dev/null | tr '\\0' 'a' | fold -w 80"
+            };
+            cmd.args(["-c", script]);
+            cmd
+        }
+    }
+
     #[test]
     fn test_exit_code_zero() {
-        let status = Command::new("true").status().unwrap();
+        let status = command_exit(0).status().unwrap();
         assert_eq!(status_to_exit_code(status), 0);
     }
 
     #[test]
     fn test_exit_code_nonzero() {
-        let status = Command::new("false").status().unwrap();
+        let status = command_exit(1).status().unwrap();
         assert_eq!(status_to_exit_code(status), 1);
     }
 
@@ -548,8 +653,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_passthrough_echo() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("hello");
+        let mut cmd = command_echo("hello");
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 0);
         // Passthrough inherits TTY — raw/filtered are empty
@@ -558,15 +662,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_exit_code_preserved() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "exit 42"]);
+        let mut cmd = command_exit(42);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 42);
     }
 
     #[test]
     fn test_run_streaming_exit_code_zero() {
-        let mut cmd = Command::new("true");
+        let mut cmd = command_exit(0);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(result.success());
@@ -574,7 +677,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_exit_code_one() {
-        let mut cmd = Command::new("false");
+        let mut cmd = command_exit(1);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 1);
         assert!(!result.success());
@@ -622,12 +725,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_raw_cap_at_10mb() {
-        let mut cmd = Command::new("sh");
-        // ~11 MiB of 80-char lines (fast: fewer lines than `yes | head -6M`)
-        cmd.args([
-            "-c",
-            "dd if=/dev/zero bs=1024 count=11264 2>/dev/null | tr '\\0' 'a' | fold -w 80",
-        ]);
+        let mut cmd = command_large_output(false);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         assert!(
             result.raw.len() <= 10_485_760 + 100,
@@ -642,12 +740,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_stderr_cap_at_10mb() {
-        let mut cmd = Command::new("sh");
-        // ~11 MiB on stderr, nothing on stdout
-        cmd.args([
-            "-c",
-            "dd if=/dev/zero bs=1024 count=11264 2>/dev/null | tr '\\0' 'a' | fold -w 80 1>&2",
-        ]);
+        let mut cmd = command_large_output(true);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         // raw = raw_stdout + raw_stderr; stdout is empty so raw ≈ stderr size
         assert!(
@@ -659,7 +752,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_child_guard_prevents_zombie() {
-        let mut cmd = Command::new("true");
+        let mut cmd = command_exit(0);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().exit_code, 0);
@@ -667,31 +760,28 @@ pub(crate) mod tests {
 
     #[test]
     fn test_run_streaming_null_stdin_cat() {
-        let mut cmd = Command::new("cat");
+        let mut cmd = command_exit(0);
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 0);
     }
 
     #[test]
     fn test_run_streaming_raw_contains_stdout() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("test_output_xyz");
+        let mut cmd = command_echo("test_output_xyz");
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         assert!(result.raw.contains("test_output_xyz"));
     }
 
     #[test]
     fn test_run_streaming_capture_only_filtered_equals_raw() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("check_equality");
+        let mut cmd = command_echo("check_equality");
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::CaptureOnly).unwrap();
         assert_eq!(result.filtered.trim(), result.raw_stdout.trim());
     }
 
     #[test]
     fn test_exec_capture_success() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("hello_capture");
+        let mut cmd = command_echo("hello_capture");
         let result = exec_capture(&mut cmd).unwrap();
         assert!(result.success());
         assert_eq!(result.exit_code, 0);
@@ -700,7 +790,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_exec_capture_failure() {
-        let mut cmd = Command::new("false");
+        let mut cmd = command_exit(1);
         let result = exec_capture(&mut cmd).unwrap();
         assert!(!result.success());
         assert_eq!(result.exit_code, 1);
@@ -708,16 +798,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_exec_capture_stderr() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "echo err_msg >&2"]);
+        let mut cmd = command_stderr("err_msg");
         let result = exec_capture(&mut cmd).unwrap();
         assert!(result.stderr.contains("err_msg"));
     }
 
     #[test]
     fn test_exec_capture_combined() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "echo out_msg; echo err_msg >&2"]);
+        let mut cmd = command_combined("out_msg", "err_msg");
         let result = exec_capture(&mut cmd).unwrap();
         let combined = result.combined();
         assert!(combined.contains("out_msg"));
