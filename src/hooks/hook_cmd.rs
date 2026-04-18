@@ -9,7 +9,9 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 
-use crate::discover::registry::{has_heredoc, rewrite_command};
+use crate::discover::registry::{
+    has_heredoc, rewrite_command, rewrite_command_for_shell, RewriteShell,
+};
 
 const STDIN_CAP: usize = 1_048_576; // 1 MiB
 
@@ -30,9 +32,15 @@ fn read_stdin_limited() -> Result<String> {
 /// Format detected from the preToolUse JSON input.
 enum HookFormat {
     /// VS Code Copilot Chat / Claude Code: `tool_name` + `tool_input.command`, supports `updatedInput`.
-    VsCode { command: String },
+    VsCode {
+        command: String,
+        shell: RewriteShell,
+    },
     /// GitHub Copilot CLI: camelCase `toolName` + `toolArgs` (JSON string), deny-with-suggestion only.
-    CopilotCli { command: String },
+    CopilotCli {
+        command: String,
+        shell: RewriteShell,
+    },
     /// Non-bash tool, already uses rtk, or unknown format — pass through silently.
     PassThrough,
 }
@@ -56,8 +64,8 @@ pub fn run_copilot() -> Result<()> {
     };
 
     match detect_format(&v) {
-        HookFormat::VsCode { command } => handle_vscode(&command),
-        HookFormat::CopilotCli { command } => handle_copilot_cli(&command),
+        HookFormat::VsCode { command, shell } => handle_vscode(&command, shell),
+        HookFormat::CopilotCli { command, shell } => handle_copilot_cli(&command, shell),
         HookFormat::PassThrough => Ok(()),
     }
 }
@@ -74,8 +82,14 @@ fn detect_format(v: &Value) -> HookFormat {
                 .and_then(|c| c.as_str())
                 .filter(|c| !c.is_empty())
             {
+                let shell = if tool_name == "PowerShell" {
+                    RewriteShell::PowerShell
+                } else {
+                    RewriteShell::Posix
+                };
                 return HookFormat::VsCode {
                     command: cmd.to_string(),
+                    shell,
                 };
             }
         }
@@ -94,6 +108,7 @@ fn detect_format(v: &Value) -> HookFormat {
                     {
                         return HookFormat::CopilotCli {
                             command: cmd.to_string(),
+                            shell: RewriteShell::Posix,
                         };
                     }
                 }
@@ -105,7 +120,7 @@ fn detect_format(v: &Value) -> HookFormat {
     HookFormat::PassThrough
 }
 
-fn get_rewritten(cmd: &str) -> Option<String> {
+fn get_rewritten(cmd: &str, shell: RewriteShell) -> Option<String> {
     if has_heredoc(cmd) {
         return None;
     }
@@ -114,7 +129,7 @@ fn get_rewritten(cmd: &str) -> Option<String> {
         .map(|c| c.hooks.exclude_commands)
         .unwrap_or_default();
 
-    let rewritten = rewrite_command(cmd, &excluded)?;
+    let rewritten = rewrite_command_for_shell(cmd, &excluded, shell)?;
 
     if rewritten == cmd {
         return None;
@@ -123,13 +138,13 @@ fn get_rewritten(cmd: &str) -> Option<String> {
     Some(rewritten)
 }
 
-fn handle_vscode(cmd: &str) -> Result<()> {
+fn handle_vscode(cmd: &str, shell: RewriteShell) -> Result<()> {
     let verdict = permissions::check_command(cmd);
     if verdict == PermissionVerdict::Deny {
         return Ok(());
     }
 
-    let rewritten = match get_rewritten(cmd) {
+    let rewritten = match get_rewritten(cmd, shell) {
         Some(r) => r,
         None => return Ok(()),
     };
@@ -153,12 +168,12 @@ fn handle_vscode(cmd: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_copilot_cli(cmd: &str) -> Result<()> {
+fn handle_copilot_cli(cmd: &str, shell: RewriteShell) -> Result<()> {
     if permissions::check_command(cmd) == PermissionVerdict::Deny {
         return Ok(());
     }
 
-    let rewritten = match get_rewritten(cmd) {
+    let rewritten = match get_rewritten(cmd, shell) {
         Some(r) => r,
         None => return Ok(()),
     };
@@ -309,7 +324,12 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
         };
     }
 
-    let rewritten = match get_rewritten(cmd) {
+    let shell = match v.get("tool_name").and_then(|value| value.as_str()) {
+        Some("PowerShell") => RewriteShell::PowerShell,
+        _ => RewriteShell::Posix,
+    };
+
+    let rewritten = match get_rewritten(cmd, shell) {
         Some(r) => r,
         None => {
             return PayloadAction::Skip {
@@ -428,7 +448,7 @@ pub fn run_cursor() -> Result<()> {
         return Ok(());
     }
 
-    let rewritten = match get_rewritten(&cmd) {
+    let rewritten = match get_rewritten(&cmd, RewriteShell::Posix) {
         Some(r) => r,
         None => {
             let _ = writeln!(io::stdout(), "{{}}");
@@ -465,7 +485,7 @@ fn run_cursor_inner(input: &str) -> String {
         return "{}".to_string();
     }
 
-    match get_rewritten(&cmd) {
+    match get_rewritten(&cmd, RewriteShell::Posix) {
         Some(rewritten) => {
             let output = json!({
                 "permission": "allow",
@@ -514,9 +534,28 @@ mod tests {
     #[test]
     fn test_detect_vscode_powershell() {
         match detect_format(&vscode_input("PowerShell", "git status")) {
-            HookFormat::VsCode { command } => assert_eq!(command, "git status"),
+            HookFormat::VsCode { command, shell } => {
+                assert_eq!(command, "git status");
+                assert_eq!(shell, RewriteShell::PowerShell);
+            }
             _ => panic!("Expected VS Code PowerShell format"),
         }
+    }
+
+    #[test]
+    fn test_claude_powershell_rewrite_windows_builtin() {
+        let input = json!({
+            "tool_name": "PowerShell",
+            "tool_input": { "command": "ls -la" }
+        })
+        .to_string();
+        let result = run_claude_inner(&input).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        let cmd = v
+            .pointer("/hookSpecificOutput/updatedInput/command")
+            .and_then(|c| c.as_str())
+            .unwrap();
+        assert_eq!(cmd, "Get-ChildItem -Force");
     }
 
     #[test]
@@ -540,22 +579,22 @@ mod tests {
 
     #[test]
     fn test_get_rewritten_supported() {
-        assert!(get_rewritten("git status").is_some());
+        assert!(get_rewritten("git status", RewriteShell::Posix).is_some());
     }
 
     #[test]
     fn test_get_rewritten_unsupported() {
-        assert!(get_rewritten("htop").is_none());
+        assert!(get_rewritten("htop", RewriteShell::Posix).is_none());
     }
 
     #[test]
     fn test_get_rewritten_already_rtk() {
-        assert!(get_rewritten("rtk git status").is_none());
+        assert!(get_rewritten("rtk git status", RewriteShell::Posix).is_none());
     }
 
     #[test]
     fn test_get_rewritten_heredoc() {
-        assert!(get_rewritten("cat <<'EOF'\nhello\nEOF").is_none());
+        assert!(get_rewritten("cat <<'EOF'\nhello\nEOF", RewriteShell::Posix).is_none());
     }
 
     // --- Gemini format ---
@@ -879,7 +918,7 @@ mod tests {
         );
         // Denied commands must not be rewritten — Gemini handler checks deny before rewrite
         assert!(
-            get_rewritten("cargo test").is_some(),
+            get_rewritten("cargo test", RewriteShell::Posix).is_some(),
             "cargo test should be rewritable when not denied"
         );
     }

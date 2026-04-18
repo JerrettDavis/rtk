@@ -3,7 +3,7 @@
 use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 
-use super::lexer::{split_on_operators, tokenize, TokenKind};
+use super::lexer::{split_on_operators, tokenize, ParsedToken, TokenKind};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 /// Result of classifying a command.
@@ -19,6 +19,12 @@ pub enum Classification {
         base_command: String,
     },
     Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteShell {
+    Posix,
+    PowerShell,
 }
 
 /// Average token counts per category for estimation when no output_len available.
@@ -438,6 +444,14 @@ fn strip_trailing_redirects(cmd: &str) -> (&str, &str) {
 /// For pipes (`|`), only rewrites the left-hand command (pipe targets stay raw),
 /// but continues rewriting segments after subsequent `&&`/`||`/`;` operators.
 pub fn rewrite_command(cmd: &str, excluded: &[String]) -> Option<String> {
+    rewrite_command_for_shell(cmd, excluded, RewriteShell::Posix)
+}
+
+pub fn rewrite_command_for_shell(
+    cmd: &str,
+    excluded: &[String],
+    shell: RewriteShell,
+) -> Option<String> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return None;
@@ -459,11 +473,11 @@ pub fn rewrite_command(cmd: &str, excluded: &[String]) -> Option<String> {
         return Some(trimmed.to_string());
     }
 
-    rewrite_compound(trimmed, excluded)
+    rewrite_compound(trimmed, excluded, shell)
 }
 
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
-fn rewrite_compound(cmd: &str, excluded: &[String]) -> Option<String> {
+fn rewrite_compound(cmd: &str, excluded: &[String], shell: RewriteShell) -> Option<String> {
     let tokens = tokenize(cmd);
     let mut result = String::with_capacity(cmd.len() + 32);
     let mut any_changed = false;
@@ -476,7 +490,8 @@ fn rewrite_compound(cmd: &str, excluded: &[String]) -> Option<String> {
         match tok.kind {
             TokenKind::Operator => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded).unwrap_or_else(|| seg.to_string());
+                let rewritten =
+                    rewrite_segment(seg, excluded, shell).unwrap_or_else(|| seg.to_string());
                 if rewritten != seg {
                     any_changed = true;
                 }
@@ -506,7 +521,7 @@ fn rewrite_compound(cmd: &str, excluded: &[String]) -> Option<String> {
                 let rewritten = if is_pipe_incompatible {
                     seg.to_string()
                 } else {
-                    rewrite_segment(seg, excluded).unwrap_or_else(|| seg.to_string())
+                    rewrite_segment(seg, excluded, shell).unwrap_or_else(|| seg.to_string())
                 };
                 if rewritten != seg {
                     any_changed = true;
@@ -534,7 +549,8 @@ fn rewrite_compound(cmd: &str, excluded: &[String]) -> Option<String> {
             }
             TokenKind::Shellism if tok.value == "&" => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded).unwrap_or_else(|| seg.to_string());
+                let rewritten =
+                    rewrite_segment(seg, excluded, shell).unwrap_or_else(|| seg.to_string());
                 if rewritten != seg {
                     any_changed = true;
                 }
@@ -550,7 +566,7 @@ fn rewrite_compound(cmd: &str, excluded: &[String]) -> Option<String> {
     }
 
     let seg = cmd[seg_start..].trim();
-    let rewritten = rewrite_segment(seg, excluded).unwrap_or_else(|| seg.to_string());
+    let rewritten = rewrite_segment(seg, excluded, shell).unwrap_or_else(|| seg.to_string());
     if rewritten != seg {
         any_changed = true;
     }
@@ -595,11 +611,16 @@ const SHELL_PREFIX_BUILTINS: &[&str] = &["noglob", "command", "builtin", "exec",
 
 const MAX_PREFIX_DEPTH: usize = 10;
 
-fn rewrite_segment(seg: &str, excluded: &[String]) -> Option<String> {
-    rewrite_segment_inner(seg, excluded, 0)
+fn rewrite_segment(seg: &str, excluded: &[String], shell: RewriteShell) -> Option<String> {
+    rewrite_segment_inner(seg, excluded, shell, 0)
 }
 
-fn rewrite_segment_inner(seg: &str, excluded: &[String], depth: usize) -> Option<String> {
+fn rewrite_segment_inner(
+    seg: &str,
+    excluded: &[String],
+    shell: RewriteShell,
+    depth: usize,
+) -> Option<String> {
     let trimmed = seg.trim();
     if trimmed.is_empty() {
         return None;
@@ -614,10 +635,8 @@ fn rewrite_segment_inner(seg: &str, excluded: &[String], depth: usize) -> Option
             if rest.is_empty() {
                 return None;
             }
-            return match rewrite_segment_inner(rest, excluded, depth + 1) {
-                Some(rewritten) => Some(format!("{} {}", prefix, rewritten)),
-                None => None,
-            };
+            return rewrite_segment_inner(rest, excluded, shell, depth + 1)
+                .map(|rewritten| format!("{} {}", prefix, rewritten));
         }
     }
 
@@ -644,22 +663,6 @@ fn rewrite_segment_inner(seg: &str, excluded: &[String], depth: usize) -> Option
         }
     }
 
-    // Use classify_command for correct ignore/prefix handling
-    let rtk_equivalent = match classify_command(cmd_part) {
-        Classification::Supported { rtk_equivalent, .. } => {
-            // Check if the base command is excluded from rewriting (#243)
-            let base = cmd_part.split_whitespace().next().unwrap_or("");
-            if excluded.iter().any(|e| e == base) {
-                return None;
-            }
-            rtk_equivalent
-        }
-        _ => return None,
-    };
-
-    // Find the matching rule (rtk_cmd values are unique across all rules)
-    let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
-
     // Extract env prefix (sudo, env VAR=val, etc.)
     let stripped_cow = ENV_PREFIX.replace(cmd_part, "");
     let env_prefix_len = cmd_part.len() - stripped_cow.len();
@@ -675,6 +678,28 @@ fn rewrite_segment_inner(seg: &str, excluded: &[String], depth: usize) -> Option
         );
         return None;
     }
+
+    if shell == RewriteShell::PowerShell {
+        if let Some(rewritten) = rewrite_powershell_builtin(cmd_clean) {
+            return Some(format!("{}{}{}", env_prefix, rewritten, redirect_suffix));
+        }
+    }
+
+    // Use classify_command for correct ignore/prefix handling
+    let rtk_equivalent = match classify_command(cmd_part) {
+        Classification::Supported { rtk_equivalent, .. } => {
+            // Check if the base command is excluded from rewriting (#243)
+            let base = cmd_part.split_whitespace().next().unwrap_or("");
+            if excluded.iter().any(|e| e == base) {
+                return None;
+            }
+            rtk_equivalent
+        }
+        _ => return None,
+    };
+
+    // Find the matching rule (rtk_cmd values are unique across all rules)
+    let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
 
     if let Some(parts) = parse_golangci_run_parts(cmd_clean) {
         let rewritten = if parts.global_segment.is_empty() {
@@ -713,6 +738,166 @@ fn rewrite_segment_inner(seg: &str, excluded: &[String], depth: usize) -> Option
     }
 
     None
+}
+
+fn rewrite_powershell_builtin(cmd: &str) -> Option<String> {
+    let tokens = tokenize(cmd);
+    let first = tokens.first()?;
+    if first.kind != TokenKind::Arg {
+        return None;
+    }
+
+    match first.value.to_ascii_lowercase().as_str() {
+        "ls" | "dir" => Some(rewrite_powershell_get_child_item(&tokens)),
+        "echo" => Some(replace_leading_command(cmd, &tokens, "Write-Output")),
+        "wc" => rewrite_powershell_wc(&tokens),
+        _ => None,
+    }
+}
+
+fn replace_leading_command(cmd: &str, tokens: &[ParsedToken], replacement: &str) -> String {
+    if let Some(second) = tokens.get(1) {
+        format!("{} {}", replacement, cmd[second.offset..].trim_start())
+    } else {
+        replacement.to_string()
+    }
+}
+
+fn push_unique_arg(args: &mut Vec<String>, value: &str) {
+    if !args.iter().any(|existing| existing == value) {
+        args.push(value.to_string());
+    }
+}
+
+fn rewrite_powershell_get_child_item(tokens: &[ParsedToken]) -> String {
+    let mut translated = Vec::new();
+    let mut passthrough = Vec::new();
+    let mut parsing_options = true;
+
+    for token in tokens.iter().skip(1) {
+        if token.kind != TokenKind::Arg {
+            passthrough.push(token.value.clone());
+            continue;
+        }
+
+        let arg = token.value.as_str();
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            continue;
+        }
+
+        if parsing_options && arg.starts_with("--") {
+            match arg {
+                "--all" => push_unique_arg(&mut translated, "-Force"),
+                "--recursive" => push_unique_arg(&mut translated, "-Recurse"),
+                "--long" | "--human-readable" => {}
+                _ => passthrough.push(arg.to_string()),
+            }
+            continue;
+        }
+
+        if parsing_options && arg.starts_with('-') && arg.len() > 1 {
+            let mut unknown_flags = String::new();
+            for ch in arg.chars().skip(1) {
+                match ch {
+                    'a' => push_unique_arg(&mut translated, "-Force"),
+                    'R' => push_unique_arg(&mut translated, "-Recurse"),
+                    'l' | 'h' | '1' => {}
+                    _ => unknown_flags.push(ch),
+                }
+            }
+            if !unknown_flags.is_empty() {
+                passthrough.push(format!("-{}", unknown_flags));
+            }
+            continue;
+        }
+
+        parsing_options = false;
+        passthrough.push(arg.to_string());
+    }
+
+    let mut rewritten = vec!["Get-ChildItem".to_string()];
+    rewritten.extend(translated);
+    rewritten.extend(passthrough);
+    rewritten.join(" ")
+}
+
+fn rewrite_powershell_wc(tokens: &[ParsedToken]) -> Option<String> {
+    let mut measure_switches = Vec::new();
+    let mut paths = Vec::new();
+    let mut parsing_options = true;
+    let mut byte_count_only = false;
+
+    for token in tokens.iter().skip(1) {
+        if token.kind != TokenKind::Arg {
+            return None;
+        }
+
+        let arg = token.value.as_str();
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+            continue;
+        }
+
+        if parsing_options && arg.starts_with('-') && arg.len() > 1 {
+            let mut saw_supported_flag = false;
+            for ch in arg.chars().skip(1) {
+                match ch {
+                    'l' => {
+                        push_unique_arg(&mut measure_switches, "-Line");
+                        saw_supported_flag = true;
+                    }
+                    'w' => {
+                        push_unique_arg(&mut measure_switches, "-Word");
+                        saw_supported_flag = true;
+                    }
+                    'm' => {
+                        push_unique_arg(&mut measure_switches, "-Character");
+                        saw_supported_flag = true;
+                    }
+                    'c' => {
+                        byte_count_only = true;
+                        saw_supported_flag = true;
+                    }
+                    _ => return None,
+                }
+            }
+
+            if byte_count_only && (!saw_supported_flag || !measure_switches.is_empty()) {
+                return None;
+            }
+            continue;
+        }
+
+        parsing_options = false;
+        paths.push(arg.to_string());
+    }
+
+    if paths.is_empty() {
+        return None;
+    }
+
+    let path_expr = paths.join(" ");
+    if byte_count_only {
+        return Some(format!(
+            "Get-Item {} | Measure-Object -Property Length -Sum",
+            path_expr
+        ));
+    }
+
+    if measure_switches.is_empty() {
+        measure_switches.extend(
+            ["-Line", "-Word", "-Character"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+
+    Some(format!(
+        "Get-Content {} | Measure-Object {}",
+        path_expr,
+        measure_switches.join(" ")
+    ))
 }
 
 /// Strip a command prefix with word-boundary check.
@@ -3276,6 +3461,50 @@ mod tests {
         assert_eq!(
             rewrite_command("git log | head | tail && git status", &[]),
             Some("rtk git log | head | tail && rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_powershell_ls_to_get_child_item() {
+        assert_eq!(
+            rewrite_command_for_shell("ls -la src", &[], RewriteShell::PowerShell),
+            Some("Get-ChildItem -Force src".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_powershell_dir_to_get_child_item() {
+        assert_eq!(
+            rewrite_command_for_shell("dir src", &[], RewriteShell::PowerShell),
+            Some("Get-ChildItem src".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_powershell_echo_to_write_output() {
+        assert_eq!(
+            rewrite_command_for_shell(r#"echo "hello world""#, &[], RewriteShell::PowerShell),
+            Some(r#"Write-Output "hello world""#.into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_powershell_wc_to_measure_object() {
+        assert_eq!(
+            rewrite_command_for_shell("wc -l README.md", &[], RewriteShell::PowerShell),
+            Some("Get-Content README.md | Measure-Object -Line".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_powershell_compound_mixed_with_rtk() {
+        assert_eq!(
+            rewrite_command_for_shell(
+                "git status && ls -a && echo done",
+                &[],
+                RewriteShell::PowerShell
+            ),
+            Some("rtk git status && Get-ChildItem -Force && Write-Output done".into())
         );
     }
 }
