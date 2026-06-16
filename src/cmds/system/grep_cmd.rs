@@ -386,9 +386,23 @@ pub fn run(
     let raw_output = result.stdout.clone();
 
     if result.stdout.trim().is_empty() {
-        // Show stderr for errors (bad regex, missing file, etc.)
-        if exit_code == 2 && !result.stderr.trim().is_empty() {
-            eprintln!("{}", result.stderr.trim());
+        // grep/rg convention: exit 1 = no match found (normal).
+        // exit >= 2 = real error (bad regex, tool crash, etc.) — surface it,
+        // never print "0 matches" for an error.
+        const GREP_ERROR_EXIT: i32 = 2;
+        if exit_code >= GREP_ERROR_EXIT {
+            if !result.stderr.trim().is_empty() {
+                eprintln!("{}", result.stderr.trim());
+            }
+            let msg = format!("grep failed with exit code {}", exit_code);
+            timer.track(
+                &format!("grep -rn '{}' {}", pattern_display, path_display),
+                "rtk grep",
+                &raw_output,
+                &msg,
+            );
+            eprintln!("{}", msg);
+            return Ok(exit_code);
         }
         let msg = format!("0 matches for '{}'", pattern_display);
         println!("{}", msg);
