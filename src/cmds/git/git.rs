@@ -1737,6 +1737,19 @@ fn run_worktree(args: &[String], verbose: u8, global_args: &[String]) -> Result<
     cmd.args(["worktree", "list"]);
     let result = exec_capture(&mut cmd).context("Failed to run git worktree list")?;
 
+    if !result.success() {
+        if !result.stderr.trim().is_empty() {
+            eprintln!("{}", result.stderr);
+        }
+        timer.track(
+            "git worktree list",
+            "rtk git worktree",
+            &result.stdout,
+            &result.stderr,
+        );
+        return Ok(result.exit_code);
+    }
+
     let filtered = filter_worktree_list(&result.stdout);
     let filtered = never_worse(&result.stdout, &filtered).to_string();
     println!("{}", filtered);
@@ -2107,6 +2120,16 @@ mod tests {
         assert!(result.contains("abc1234"));
         assert!(result.contains("[main]"));
         assert!(result.contains("[feature]"));
+    }
+
+    #[test]
+    fn test_run_worktree_list_propagates_failure() {
+        // #2497: `git worktree list` outside a repo exits non-zero; rtk must not
+        // report success (empty output + exit 0).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let global = vec!["-C".to_string(), dir.path().to_string_lossy().into_owned()];
+        let code = run_worktree(&[], 0, &global).expect("run_worktree");
+        assert_ne!(code, 0, "git worktree list failure must propagate");
     }
 
     #[test]
