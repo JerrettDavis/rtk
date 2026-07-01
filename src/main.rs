@@ -17,12 +17,12 @@ use cmds::js::{
 };
 use cmds::jvm::{gradlew_cmd, mvn_cmd};
 use cmds::php::{ecs_cmd, paratest_cmd, pest_cmd, php_cmd, phpstan_cmd, phpunit_cmd, pint_cmd};
-use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd};
+use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd, uv_cmd};
 use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::system::{
-    deps, env_cmd, find_cmd, format_cmd, grep_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd,
-    read, summary, tree, wc_cmd,
+    deps, env_cmd, find_cmd, format_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd, read, search,
+    summary, tree, wc_cmd,
 };
 
 use anyhow::{Context, Result};
@@ -319,6 +319,13 @@ enum Commands {
         #[arg(short = 't', long)]
         file_type: Option<String>,
         /// Pattern, path, and any grep/rg flags (e.g. -v, -i, -A 3, --glob, --version)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra_args: Vec<String>,
+    },
+
+    /// Compact ripgrep - runs rg natively, same output filter as grep
+    Rg {
+        /// Pattern, path, and any rg flags (e.g. -v, -i, -t rust, --glob)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -749,6 +756,13 @@ enum Commands {
     /// Pip package manager with compact output (auto-detects uv)
     Pip {
         /// Pip arguments (e.g., list, outdated, install)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// uv run with compact output while preserving uv-managed environment semantics
+    Uv {
+        /// uv arguments (e.g., run pytest, run --project backend python script.py)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -1907,16 +1921,19 @@ fn run_cli() -> Result<i32> {
             max_len,
             max,
             context_only,
-            file_type,
+            file_type: _,
             extra_args,
-        } => grep_cmd::run(
+        } => search::run(
+            search::Engine::Grep,
             max_len,
             max,
             context_only,
-            file_type.as_deref(),
             &extra_args,
             cli.verbose,
         )?,
+        Commands::Rg { extra_args } => {
+            search::run(search::Engine::Rg, 80, 200, false, &extra_args, cli.verbose)?
+        }
 
         Commands::Init {
             global,
@@ -2290,6 +2307,8 @@ fn run_cli() -> Result<i32> {
 
         Commands::Pip { args } => pip_cmd::run(&args, cli.verbose)?,
 
+        Commands::Uv { args } => uv_cmd::run(&args, cli.verbose)?,
+
         Commands::Go { command } => match command {
             GoCommands::Test { args } => go_cmd::run_test(&args, cli.verbose)?,
             GoCommands::Build { args } => go_cmd::run_build(&args, cli.verbose)?,
@@ -2385,7 +2404,7 @@ fn run_cli() -> Result<i32> {
                     .arg(&raw)
                     .status()
                     .with_context(|| format!("Failed to execute: {}", raw))?;
-                status.code().unwrap_or(1)
+                core::utils::exit_code_from_status(&status, "run")
             }
         }
 
@@ -2633,6 +2652,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Oc { .. }
             | Commands::Summary { .. }
             | Commands::Grep { .. }
+            | Commands::Rg { .. }
             | Commands::Wget { .. }
             | Commands::Vitest { .. }
             | Commands::Prisma { .. }
@@ -2658,6 +2678,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Rubocop { .. }
             | Commands::Rspec { .. }
             | Commands::Pip { .. }
+            | Commands::Uv { .. }
             | Commands::Go { .. }
             | Commands::GolangciLint { .. }
             | Commands::Gt { .. }
@@ -2992,6 +3013,7 @@ mod tests {
             "ls",
             "tree",
             "read",
+            "rg",
             "git",
             "gh",
             "glab",
@@ -3044,6 +3066,7 @@ mod tests {
             "paratest",
             "ecs",
             "pint",
+            "uv",
         ];
 
         let unclassified: Vec<String> = Cli::command()
