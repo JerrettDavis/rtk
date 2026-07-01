@@ -58,7 +58,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         .context("Failed to run uv")?;
     let filtered = filter_uv_run_output(&result.raw, result.exit_code);
 
-    runner::print_with_hint(&filtered, &result.raw, "uv", result.exit_code);
+    runner::print_with_hint(&filtered, &result.raw, &result.raw, "uv", result.exit_code);
     timer.track(&original_cmd, &rtk_cmd, &result.raw, &filtered);
 
     Ok(result.exit_code)
