@@ -2988,6 +2988,7 @@ mod tests {
             "golangci-lint",
             "gradlew",
             "mvn",
+            "uv",
         ];
 
         let unclassified: Vec<String> = Cli::command()
