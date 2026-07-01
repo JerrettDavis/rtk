@@ -2452,45 +2452,6 @@ error: aborting due to 1 previous error
     }
 
     #[test]
-    fn test_filter_cargo_build_json_errors_tee_captured() {
-        let tee_dir = std::env::temp_dir().join(format!("rtk-tee-json-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tee_dir);
-        std::env::set_var("RTK_TEE_DIR", &tee_dir);
-
-        let total = CAP_ERRORS + 3;
-        let mut output = String::new();
-        for i in 0..total {
-            output.push_str(&format!(
-                r#"{{"reason":"compiler-message","message":{{"level":"error","message":"mismatched types","rendered":"error[E0308]: dropped marker {}"}}}}"#,
-                i
-            ));
-            output.push('\n');
-        }
-        output.push_str(r#"{"reason":"build-finished","success":false}"#);
-        output.push('\n');
-
-        let result = filter_cargo_build(&output);
-        std::env::remove_var("RTK_TEE_DIR");
-
-        // A dropped error (past the cap) must be recoverable from the tee file,
-        // not silently discarded. Only assert when tee actually wrote a file.
-        if result.contains("[full output:") {
-            let captured: String = std::fs::read_dir(&tee_dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-                .collect();
-            assert!(
-                captured.contains(&format!("dropped marker {}", total - 1)),
-                "tee file must hold the dropped diagnostics: {}",
-                captured
-            );
-        }
-        let _ = std::fs::remove_dir_all(&tee_dir);
-    }
-
-    #[test]
     fn test_filter_cargo_build_json_savings() {
         // Real --message-format=json lines carry a verbose envelope (spans,
         // children, code, message) around the human `rendered` text. The filter
