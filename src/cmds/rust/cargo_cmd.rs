@@ -375,6 +375,11 @@ fn run_check(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 fn run_install(args: &[String], verbose: u8) -> Result<i32> {
+    if has_json_message_format(args) {
+        return run_cargo_filtered("install", args, verbose, |o| {
+            filter_cargo_build_labeled(o, "install")
+        });
+    }
     run_cargo_filtered("install", args, verbose, filter_cargo_install)
 }
 
@@ -2352,6 +2357,25 @@ error: aborting due to 1 previous error
         assert!(result.contains("cargo check:"), "got: {}", result);
         assert!(!result.contains("cargo build:"), "got: {}", result);
         assert!(result.contains("1 errors"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_filter_cargo_build_labeled_install_json_failure() {
+        let input = concat!(
+            "   Compiling sometool v0.1.0\n",
+            r#"{"reason":"compiler-message","message":{"code":{"code":"E0432"},"level":"error","message":"unresolved import","rendered":"error[E0432]: unresolved import `foo`\n --> src/main.rs:1:5"}}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":false}"#,
+            "\n",
+        );
+        let result = filter_cargo_build_labeled(input, "install");
+        assert!(result.contains("cargo install:"), "got: {}", result);
+        assert!(result.contains("1 errors"), "got: {}", result);
+        assert!(
+            !result.contains("crates compiled"),
+            "failed json install must not report success: {}",
+            result
+        );
     }
 
     #[test]
